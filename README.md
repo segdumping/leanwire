@@ -4,7 +4,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/segdumping/leanwire.svg)](https://pkg.go.dev/github.com/segdumping/leanwire)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Go实现的通信框架。内核只有两个包：`codec` 定义消息与线格式（`| len:u32 | id:u32 | body |`，大端），`server` 负责连接管理、每帧回调和启停。传输层使用标准库的 `net.Conn` / `net.Listener`，TCP、TLS无需适配。
+Go实现的通信框架。内核只有两个包：`codec` 定义消息与格式（`| len:u32 | id:u32 | body |`，大端），`server` 负责连接管理、每帧回调和启停。传输层使用标准库的 `net.Conn` / `net.Listener`，TCP、TLS无需适配。
 
 路由、RPC、心跳、服务目录等能力以插件形式放在 `ext/`，按需引入；`app` 包把它们与内核组合成单进程服务骨架，目录注册、出站连接、依赖重连和生命周期都已内置。
 
@@ -14,8 +14,8 @@ Go实现的通信框架。内核只有两个包：`codec` 定义消息与线格�
 - 传输接口即标准库的 `net.Conn` / `net.Listener`，WebSocket、QUIC、gRPC通过适配器接入
 - 回调在读协程内联执行，同一连接严格保序，panic被隔离为连接关闭
 - 三种发送语义：`Send` 阻塞入队、`SendWait` 按ctx等待、`TrySend` 队列满即返回
-- 内核对 `ext/` 零依赖，删除全部插件仍可编译（`codec/kernel_purity_test.go` 机检）
-- `app` 提供目录注册、出站依赖、请求/响应、Session与Gate，可单进程起一套服务
+- 内核对 `ext/` 零依赖，删除全部插件仍可编译
+- `app` 提供目录注册、服务依赖、请求/响应、Session与Gate，可单进程起一套服务
 
 ## 安装
 
@@ -52,7 +52,6 @@ func main() {
 	routeTable := router.New()
 	srv.SetRootHandler(routeTable.Handler())
 
-	// msgID 1：回显
 	routeTable.Handle(1, func(s *server.Conn, m codec.Msg) {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
@@ -81,7 +80,7 @@ func main() {
 }
 ```
 
-`Start` 只标记启动，`Shutdown(ctx)` 才等待读写协程退出，两步都由调用方驱动。
+`Start` 只标记启动，`Shutdown(ctx)` 等待读写协程退出，两步都由调用方驱动。
 
 ### 客户端
 
@@ -132,7 +131,7 @@ a.OnStart(func(a *app.App) { ... })
 a.OnStop(func(a *app.App) { ... })
 a.OnFini(func(a *app.App) { ... })
 
-// 出站依赖：一条经目录选址、自动重连的持久连接
+// 服务依赖：一条经目录选址、自动重连的持久连接
 service := a.Depend("rank")
 ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 defer cancel()
