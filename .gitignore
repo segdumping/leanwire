@@ -1,0 +1,15 @@
+# IDE
+.idea/
+.vscode/
+
+# Go
+*.exe
+*.exe~
+*.test
+*.out
+*.prof
+vendor/
+
+# OS
+.DS_Store
+Thumbs.db

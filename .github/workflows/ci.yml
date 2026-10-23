@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: false
+      - name: Build
+        run: go build -buildvcs=false ./...
+      - name: Vet
+        run: go vet -buildvcs=false ./...
+      - name: Test
+        run: go test -count=1 ./...
+
+  # 全并发的框架：race 测试独立成档（需要 cgo，ubuntu 自带 gcc）。
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: false
+      - name: Test with race detector
+        run: go test -race -count=1 ./...
