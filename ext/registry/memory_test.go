@@ -54,7 +54,7 @@ func TestMemoryLifecycle(t *testing.T) {
 	dB() // 关闭后 dereg 也无 panic
 }
 
-// 同 (name, Addr) 覆盖更新；任一句柄 dereg 即下线。
+// 同地址覆盖注册产生新的一代实例；旧句柄 dereg 不误删新实例，最新句柄才生效。
 func TestMemoryDuplicateSameAddr(t *testing.T) {
 	r := NewMemory()
 	ctx := context.Background()
@@ -72,11 +72,18 @@ func TestMemoryDuplicateSameAddr(t *testing.T) {
 		return len(s) == 1 && s[0].Weight == 7
 	})
 
-	d1() // 任一句柄生效即下线
+	// 旧句柄 dereg 不影响替换后的新实例
+	n := ch.frames()
+	d1()
+	if got := ch.frames(); got != n {
+		t.Fatalf("old handle dereg removed replaced instance: %d -> %d", n, got)
+	}
+
+	d2() // 最新句柄 dereg 才下线
 	waitFor(t, func() bool { return len(ch.snapshot()) == 0 })
 
-	// 另一句柄再 dereg 无事件
-	n := ch.frames()
+	// 再 dereg 无事件
+	n = ch.frames()
 	d2()
 	if got := ch.frames(); got != n {
 		t.Fatalf("handle 2 dereg after removal grew frames: %d -> %d", n, got)
@@ -255,4 +262,45 @@ func waitFor(t *testing.T, pred func() bool) {
 		time.Sleep(2 * time.Millisecond)
 	}
 	t.Fatal("wait timeout")
+}
+
+// 快照 Meta 深拷贝：调用方与回调侧改动互不污染内部状态。
+func TestMemorySnapshotMetaIsolated(t *testing.T) {
+	r := NewMemory()
+	defer r.Close()
+	ctx := context.Background()
+
+	meta := map[string]string{"zone": "a"}
+	d, err := r.Register(ctx, "game", Endpoint{Addr: "a:1", Meta: meta})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d()
+
+	ch := &snapCh{}
+	if err := r.Watch(ctx, "game", withSnap(ch)); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return len(ch.snapshot()) == 1 })
+
+	// 注册方事后改自己的 map：后续快照仍为注册时的值（deep clone on snapshot）
+	meta["zone"] = "mutated"
+	snap := ch.snapshot()
+	snap[0].Meta["zone"] = "polluted"
+
+	d2, err := r.Register(ctx, "game", Endpoint{Addr: "b:1"}) // 触发新快照
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d2()
+	waitFor(t, func() bool { return len(ch.snapshot()) == 2 })
+	var kept []Endpoint
+	if err := r.Watch(t.Context(), "game", func(eps []Endpoint) { kept = eps }); err != nil {
+		t.Fatal(err)
+	}
+	for _, ep := range kept {
+		if ep.Addr == "a:1" && ep.Meta["zone"] != "a" {
+			t.Fatalf("internal Meta polluted: %+v", ep)
+		}
+	}
 }

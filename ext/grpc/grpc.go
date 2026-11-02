@@ -6,12 +6,13 @@ import (
 	"io"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	ggrpc "google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -21,6 +22,9 @@ const (
 
 	acceptQueue = 16
 )
+
+// adoptWait accept 队列满时的阻塞上限，超时回 ResourceExhausted。
+var adoptWait = 5 * time.Second
 
 type frame struct{ data []byte }
 
@@ -119,17 +123,26 @@ func (l *Listener) Close() error {
 
 func (l *Listener) Addr() net.Addr { return l.addr }
 
+// adoptConn 把连接投递进 accept 队列：队列满时阻塞等待有界时长，
+// 与 WS/QUIC 对齐（阻塞而非静默断开），超时由调用方回 ResourceExhausted。
 func (l *Listener) adoptConn(c net.Conn) bool {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.closed {
+	closed := l.closed
+	l.mu.Unlock()
+	if closed {
 		return false
 	}
-	select {
-	case l.ch <- c:
-		return true
-	default:
-		return false
+	timer := time.NewTimer(adoptWait)
+	defer timer.Stop()
+	for {
+		select {
+		case l.ch <- c:
+			return true
+		case <-timer.C:
+			return false
+		case <-l.done:
+			return false
+		}
 	}
 }
 
@@ -141,7 +154,7 @@ func (l *Listener) adopt(stream ggrpc.ServerStream) error {
 	}
 	if !l.adoptConn(c) {
 		_ = c.Close()
-		return nil
+		return status.Errorf(codes.ResourceExhausted, "grpc transport: accept queue full")
 	}
 	select {
 	case <-c.closed:
@@ -152,6 +165,9 @@ func (l *Listener) adopt(stream ggrpc.ServerStream) error {
 }
 
 // Dial 拨出并打开一条双向流作为 net.Conn。
+// 建立 NewStream 阶段受 ctx 约束（超时/取消即时失败）；
+// 流建立后生命周期与拨号 ctx 解耦——调用方用短超时 ctx 拨号时，
+// ctx 到期取消不应随断掉已建立的连接。
 func Dial(ctx context.Context, target string, opts ...ggrpc.DialOption) (net.Conn, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -160,17 +176,32 @@ func Dial(ctx context.Context, target string, opts ...ggrpc.DialOption) (net.Con
 	if err != nil {
 		return nil, err
 	}
-	streamContext, cancel := context.WithCancel(ctx)
-	cs, err := cc.NewStream(streamContext, streamDesc, methodPath, ggrpc.CallContentSubtype(codecName))
-	if err != nil {
-		cancel()
-		_ = cc.Close()
-		return nil, err
+	streamContext, cancel := context.WithCancel(context.Background())
+	type dialResult struct {
+		cs  ggrpc.ClientStream
+		err error
 	}
-	c := newConn(cs, cancel, cc)
-	c.local = stringAddr{network: "grpc", addr: "local"}
-	c.remote = stringAddr{network: "grpc", addr: target}
-	return c, nil
+	done := make(chan dialResult, 1)
+	go func() {
+		cs, err := cc.NewStream(streamContext, streamDesc, methodPath, ggrpc.CallContentSubtype(codecName))
+		done <- dialResult{cs: cs, err: err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			cancel()
+			_ = cc.Close()
+			return nil, r.err
+		}
+		c := newConn(r.cs, cancel, cc)
+		c.local = stringAddr{network: "grpc", addr: "local"}
+		c.remote = stringAddr{network: "grpc", addr: target}
+		return c, nil
+	case <-ctx.Done():
+		cancel() // NewStream 迟到成功也会随 ctx/streamContext 关断
+		_ = cc.Close()
+		return nil, ctx.Err()
+	}
 }
 
 type streamIO interface {
@@ -201,8 +232,10 @@ type Conn struct {
 	rdGen     chan struct{}
 
 	wmu       sync.Mutex
-	wsend     sync.Mutex
 	wdeadline time.Time
+	wdGen     chan struct{}
+
+	sendSlot chan struct{} // 写互斥槽位：同一时刻至多一条 SendMsg 在途，超时放弃但不释放
 
 	in chan []byte
 
@@ -214,12 +247,14 @@ var _ net.Conn = (*Conn)(nil)
 
 func newConn(stream streamIO, cancel context.CancelFunc, cc *ggrpc.ClientConn) *Conn {
 	c := &Conn{
-		stream: stream,
-		cancel: cancel,
-		cc:     cc,
-		closed: make(chan struct{}),
-		rdGen:  make(chan struct{}),
-		in:     make(chan []byte, 1),
+		stream:   stream,
+		cancel:   cancel,
+		cc:       cc,
+		closed:   make(chan struct{}),
+		rdGen:    make(chan struct{}),
+		wdGen:    make(chan struct{}),
+		sendSlot: make(chan struct{}, 1),
+		in:       make(chan []byte, 1),
 	}
 	go c.pump()
 	return c
@@ -346,53 +381,107 @@ func (c *Conn) tryRead(p []byte) (int, bool) {
 	}
 }
 
+// Write 语义对齐 net.Conn：写 deadline 只影响本次等待，到期返回超时错误，
+// 不关流、不记连接级错误，之后仍可重试；重试期间旧发送未完则先等其让出槽位。
 func (c *Conn) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	c.wsend.Lock()
-	defer c.wsend.Unlock()
+
+	buffer := make([]byte, len(p))
+	copy(buffer, p)
 
 	c.wmu.Lock()
 	dl := c.wdeadline
 	c.wmu.Unlock()
 
-	buffer := make([]byte, len(p))
-	copy(buffer, p)
-
-	var timedOut atomic.Bool
-	var timer *time.Timer
+	// 写互斥槽位：同一时刻至多一条 SendMsg 在途。已设 deadline 时等槽同样受其
+	// 约束：首次发送超时后在途 SendMsg 仍持槽（如被对端流控卡住），重试的
+	// Write 必须能到点返回超时，而不是无限阻塞在槽位上。
+	var slotTimer *time.Timer
+	var slotTimeout <-chan time.Time
 	if !dl.IsZero() {
-		d := time.Until(dl)
-		if d <= 0 {
-			return 0, deadlineError{}
+		if d := time.Until(dl); d <= 0 {
+			return 0, deadlineError{} // 快路径：deadline 已过期，不发起发送
+		} else {
+			slotTimer = time.NewTimer(d)
+			slotTimeout = slotTimer.C
 		}
-		timer = time.AfterFunc(d, func() {
-			timedOut.Store(true)
-			c.setLastErr(deadlineError{})
-			_ = c.Close()
-		})
+	}
+	stopSlot := func() {
+		if slotTimer != nil {
+			slotTimer.Stop()
+		}
+	}
+	select {
+	case c.sendSlot <- struct{}{}:
+		stopSlot()
+	case <-slotTimeout:
+		return 0, deadlineError{}
+	case <-c.closed:
+		stopSlot()
+		return 0, net.ErrClosed
 	}
 
-	err := c.stream.SendMsg(&frame{data: buffer})
-	if timer != nil {
-		timer.Stop()
+	type sendResult struct {
+		n   int
+		err error
 	}
-	if timedOut.Load() {
-		return 0, deadlineError{}
-	}
-	if err != nil {
-		if lerr := c.lastError(); lerr != nil {
-			return 0, lerr
+	done := make(chan sendResult, 1)
+	go func() {
+		err := c.stream.SendMsg(&frame{data: buffer})
+		<-c.sendSlot // 发送完成（含出错）才让出槽位
+		done <- sendResult{n: len(buffer), err: err}
+	}()
+
+	for {
+		c.wmu.Lock()
+		dl := c.wdeadline
+		gen := c.wdGen
+		c.wmu.Unlock()
+
+		var timer *time.Timer
+		var tch <-chan time.Time
+		if !dl.IsZero() {
+			if d := time.Until(dl); d <= 0 {
+				// 槽位由在途 SendMsg 自行释放；Close 会关断流使其尽快结束
+				return 0, deadlineError{}
+			} else {
+				timer = time.NewTimer(d)
+				tch = timer.C
+			}
 		}
+		stop := func() {
+			if timer != nil {
+				timer.Stop()
+			}
+		}
+
 		select {
+		case r := <-done:
+			stop()
+			if r.err != nil {
+				if lerr := c.lastError(); lerr != nil {
+					return 0, lerr
+				}
+				select {
+				case <-c.closed:
+					return 0, net.ErrClosed
+				default:
+				}
+				return 0, r.err
+			}
+			return r.n, nil
+		case <-tch:
+			return 0, deadlineError{}
+		case <-gen:
+			stop()
+			continue
 		case <-c.closed:
+			stop()
 			return 0, net.ErrClosed
-		default:
 		}
-		return 0, err
 	}
-	return len(p), nil
 }
 
 // Close 关闭连接，幂等。
@@ -424,6 +513,8 @@ func (c *Conn) SetReadDeadline(t time.Time) error {
 func (c *Conn) SetWriteDeadline(t time.Time) error {
 	c.wmu.Lock()
 	c.wdeadline = t
+	close(c.wdGen)
+	c.wdGen = make(chan struct{})
 	c.wmu.Unlock()
 	return nil
 }

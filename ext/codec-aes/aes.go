@@ -8,6 +8,7 @@ import (
 	"crypto/cipher"
 	crand "crypto/rand"
 	"encoding/binary"
+	"errors"
 	"io"
 	"sync"
 	"weak"
@@ -18,6 +19,12 @@ import (
 const defaultMaxBody = 102400
 
 const sweepEvery = 64
+
+// strongTableLimit wrAny/rdAny 强引用表上限：强引用不能被 GC 回收，
+// 非 bufio 读写器形态下若不去界会无界增长；超限拒绝登记并报错。
+const strongTableLimit = 4096
+
+var errStrongTableFull = errors.New("gateaes: strong stream table saturated")
 
 type config struct {
 	key      []byte
@@ -183,6 +190,9 @@ func (c *Codec) writeStream(w io.Writer) (cipher.Stream, error) {
 	if stream, ok := c.wrAny[w]; ok {
 		return stream, nil
 	}
+	if len(c.wrAny) >= strongTableLimit {
+		return nil, errStrongTableFull
+	}
 	stream := c.newCTR(true)
 	c.wrAny[w] = stream
 	return stream, nil
@@ -203,6 +213,9 @@ func (c *Codec) readStream(r io.Reader) (cipher.Stream, error) {
 	}
 	if stream, ok := c.rdAny[r]; ok {
 		return stream, nil
+	}
+	if len(c.rdAny) >= strongTableLimit {
+		return nil, errStrongTableFull
 	}
 	stream := c.newCTR(false)
 	c.rdAny[r] = stream
@@ -331,6 +344,9 @@ func (c *SecureCodec) readStream(r io.Reader) (*secureStream, error) {
 		if cur, ok := c.rdAny[r]; ok {
 			return cur, nil
 		}
+		if len(c.rdAny) >= strongTableLimit {
+			return nil, errStrongTableFull
+		}
 		c.rdAny[r] = stream
 	}
 	return stream, nil
@@ -428,6 +444,9 @@ func (c *SecureCodec) writeStream(w io.Writer) (*secureStream, bool, error) {
 	} else {
 		if cur, ok := c.wrAny[w]; ok {
 			return cur, false, nil
+		}
+		if len(c.wrAny) >= strongTableLimit {
+			return nil, false, errStrongTableFull
 		}
 		c.wrAny[w] = stream
 	}

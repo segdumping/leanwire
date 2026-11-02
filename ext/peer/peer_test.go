@@ -28,7 +28,7 @@ func TestPeerReconnects(t *testing.T) {
 
 	testEndCh := make(chan net.Conn, 8)
 	calls := 0
-	dialer := func() (net.Conn, error) {
+	dialer := func(context.Context) (net.Conn, error) {
 		switch calls++; calls {
 		case 1:
 			return nil, errors.New("dial fail #1")
@@ -105,7 +105,7 @@ func TestStartIdempotent(t *testing.T) {
 
 	var dials atomic.Int64
 	block := make(chan struct{})
-	r := New(app, func() (net.Conn, error) {
+	r := New(app, func(context.Context) (net.Conn, error) {
 		dials.Add(1)
 		<-block
 		return nil, errors.New("blocked dial")
@@ -132,7 +132,7 @@ func TestPeerRedialsOnImmediateClose(t *testing.T) {
 	app := server.New(server.WithLogger(quietLogger()))
 
 	var calls atomic.Int64
-	dialer := func() (net.Conn, error) {
+	dialer := func(context.Context) (net.Conn, error) {
 		calls.Add(1)
 		s, c := net.Pipe()
 		_ = c.Close() // 对端接受即断
@@ -166,7 +166,7 @@ func TestNewAfterServe(t *testing.T) {
 	app.Serve(listener) // 先 Serve
 
 	connected := make(chan *server.Conn, 1)
-	r := New(app, func() (net.Conn, error) {
+	r := New(app, func(context.Context) (net.Conn, error) {
 		return net.Dial("tcp", listener.Addr().String())
 	},
 		WithOnConnected(func(s *server.Conn) { connected <- s }),
@@ -186,14 +186,14 @@ func TestPeerStopsWithApp(t *testing.T) {
 
 	var calls atomic.Int64
 	pending := make(chan struct{}, 1)
-	dialer := func() (net.Conn, error) {
+	dialer := func(ctx context.Context) (net.Conn, error) {
 		calls.Add(1)
 		select {
 		case <-pending:
 			s, _ := net.Pipe()
 			return s, nil
-		case <-time.After(3 * time.Second):
-			return nil, errors.New("dial timeout")
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 	}
 	r := New(app, dialer, WithBackoff(5*time.Millisecond, 10*time.Millisecond))
@@ -212,4 +212,40 @@ func TestPeerStopsWithApp(t *testing.T) {
 		t.Fatalf("dial calls after shutdown = %d, want 1", got)
 	}
 	r.Stop()
+}
+
+// Stop 中断挂死的拨号：dial ctx 被取消，循环静默退出（不再记失败）。
+func TestStopCancelsStuckDial(t *testing.T) {
+	app := server.New(server.WithLogger(quietLogger()))
+
+	entered := make(chan struct{}, 1)
+	failed := make(chan error, 8)
+	r := New(app, func(ctx context.Context) (net.Conn, error) {
+		entered <- struct{}{}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(10 * time.Second):
+			return nil, errors.New("dial timeout")
+		}
+	},
+		WithOnFailed(func(err error) { failed <- err }),
+		WithLogger(quietLogger()),
+	)
+	r.Start()
+	defer r.Stop()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dial never started")
+	}
+	r.Stop() // 挂死的拨号应被取消，循环退出且不再上抛失败
+	select {
+	case err := <-failed:
+		t.Fatalf("cancelled dial reported as failure: %v", err)
+	case <-entered:
+		t.Fatal("dial retries after Stop")
+	case <-time.After(300 * time.Millisecond):
+	}
 }

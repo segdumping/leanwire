@@ -29,9 +29,10 @@ func writeMsg(t *testing.T, w io.Writer, m codec.Msg) {
 
 // 命中派发、未命中走未知策略、重复注册覆盖并继续工作。
 func TestRouteDispatch(t *testing.T) {
-	testServer := server.New(server.WithLogger(quietLogger()))
+	routeTable := New(WithLogger(quietLogger()))
+	testServer := server.New(server.WithLogger(quietLogger()), server.WithRootHandler(routeTable.Handler()))
+	routeTable.Attach(testServer)
 	defer func() { _ = testServer.Shutdown(nil) }()
-	routeTable := Bind(testServer, WithLogger(quietLogger()))
 
 	var mu sync.Mutex
 	var got []string
@@ -88,13 +89,13 @@ func TestRouteDispatch(t *testing.T) {
 
 // 未知帧自定义策略生效。
 func TestUnknownPolicy(t *testing.T) {
-	testServer := server.New(server.WithLogger(quietLogger()))
-	defer func() { _ = testServer.Shutdown(nil) }()
-
 	var hit atomic.Int64
-	routeTable := Bind(testServer, WithLogger(quietLogger()), WithUnknown(func(_ *server.Conn, m codec.Msg) {
+	routeTable := New(WithLogger(quietLogger()), WithUnknown(func(_ *server.Conn, m codec.Msg) {
 		hit.Add(1)
 	}))
+	testServer := server.New(server.WithLogger(quietLogger()), server.WithRootHandler(routeTable.Handler()))
+	routeTable.Attach(testServer)
+	defer func() { _ = testServer.Shutdown(nil) }()
 	routeTable.Handle(1, func(*server.Conn, codec.Msg) {})
 
 	serverEnd, testEnd := net.Pipe()
@@ -116,9 +117,10 @@ func TestUnknownPolicy(t *testing.T) {
 
 // MustHandle / nil / started 冻结纪律。
 func TestMustHandleDiscipline(t *testing.T) {
-	testServer := server.New(server.WithLogger(quietLogger()))
+	routeTable := New(WithLogger(quietLogger()))
+	testServer := server.New(server.WithLogger(quietLogger()), server.WithRootHandler(routeTable.Handler()))
+	routeTable.Attach(testServer)
 	defer func() { _ = testServer.Shutdown(nil) }()
-	routeTable := Bind(testServer, WithLogger(quietLogger()))
 
 	routeTable.MustHandle(1, func(*server.Conn, codec.Msg) {})
 	panicked := func(f func()) bool {
@@ -153,10 +155,11 @@ func TestMustHandleDiscipline(t *testing.T) {
 
 // 无未知策略缺省丢弃（不 panic）：发一帧未注册 ID 后连接可用。
 func TestDefaultUnknownDrop(t *testing.T) {
-	testServer := server.New(server.WithLogger(quietLogger()))
+	routeTable := New(WithLogger(quietLogger()))
+	testServer := server.New(server.WithLogger(quietLogger()), server.WithRootHandler(routeTable.Handler()))
+	routeTable.Attach(testServer)
 	defer func() { _ = testServer.Shutdown(nil) }()
-	routeTable := Bind(testServer, WithLogger(quietLogger()))
-	routeTable.Handle(1, func(s *server.Conn, m codec.Msg) { _ = s.Send(m) })
+	routeTable.Handle(1, func(s *server.Conn, m codec.Msg) { _ = s.Send(nil, m) })
 
 	serverEnd, testEnd := net.Pipe()
 	defer testEnd.Close()
@@ -177,12 +180,9 @@ func TestDefaultUnknownDrop(t *testing.T) {
 	}
 }
 
-// Bind 之后不能二次 Bind（SetRootHandler 冻结：根只许一个所有者）。
-func TestBindOnce(t *testing.T) {
-	testServer := server.New(server.WithLogger(quietLogger()))
-	defer func() { _ = testServer.Shutdown(nil) }()
-	_ = Bind(testServer, WithLogger(quietLogger()))
-
+// 根回调只允许在 server.New 时设置一次。
+func TestRootHandlerSetOnce(t *testing.T) {
+	r := New(WithLogger(quietLogger()))
 	panicked := func(f func()) bool {
 		p := false
 		func() {
@@ -191,7 +191,12 @@ func TestBindOnce(t *testing.T) {
 		}()
 		return p
 	}
-	if !panicked(func() { Bind(testServer) }) {
-		t.Fatal("second Bind should panic (root frozen)")
+	if !panicked(func() {
+		server.New(
+			server.WithRootHandler(r.Handler()),
+			server.WithRootHandler(r.Handler()),
+		)
+	}) {
+		t.Fatal("second root handler should panic")
 	}
 }

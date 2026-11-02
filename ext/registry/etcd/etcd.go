@@ -25,6 +25,8 @@ const (
 	retryMax           = 10 * time.Second
 	revokeTimeout      = 2 * time.Second
 	defaultDialTimeout = 3 * time.Second
+
+	registerRetryAttempts = 5 // 首次注册的有界重试上限，启动期瞬时不可用不再直接失败
 )
 
 type config struct {
@@ -96,6 +98,7 @@ type Registry struct {
 }
 
 var _ registry.Registry = (*Registry)(nil)
+var _ registry.ErrNotifier = (*Registry)(nil)
 
 func New(endpoints []string, opts ...Option) (*Registry, error) {
 	conf := config{
@@ -245,7 +248,28 @@ func (r *Registry) Register(ctx context.Context, name string, endpoint registry.
 	}
 	entry := &registration{reg: r, key: r.kvPrefix(name) + endpoint.Addr, val: string(val)}
 
-	if err := entry.registerOnce(ctx); err != nil {
+	// 首次注册有界退避重试：间隔对齐 keepLoop 的租约重夺退避
+	backoff := retryBase
+	for attempt := 0; attempt < registerRetryAttempts; attempt++ {
+		if err = entry.registerOnce(ctx); err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if r.ctx.Err() != nil {
+			return nil, registry.ErrClosed
+		}
+		r.log.Warn("etcd registry: register failed, retrying", "key", entry.key, "err", err)
+		if !r.sleepCtx(ctx, backoff) {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return nil, registry.ErrClosed
+		}
+		backoff = r.nextBackoff(backoff)
+	}
+	if err != nil {
 		return nil, err
 	}
 
@@ -357,6 +381,12 @@ func (entry *registration) revoke() {
 }
 
 func (r *Registry) Watch(ctx context.Context, name string, callback func([]registry.Endpoint)) error {
+	return r.WatchErr(ctx, name, callback, nil)
+}
+
+// WatchErr 行为同 Watch，另把后续异步失败经 onError 上抛（可重复）；
+// onError 与快照回调并发触发，实现保证 panic 隔离、不阻塞调用方。
+func (r *Registry) WatchErr(ctx context.Context, name string, callback func([]registry.Endpoint), onError func(err error)) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -373,12 +403,12 @@ func (r *Registry) Watch(ctx context.Context, name string, callback func([]regis
 
 	go func() {
 		defer r.wg.Done()
-		r.watchLoop(ctx, name, callback)
+		r.watchLoop(ctx, name, callback, onError)
 	}()
 	return nil
 }
 
-func (r *Registry) watchLoop(ctx context.Context, name string, callback func([]registry.Endpoint)) {
+func (r *Registry) watchLoop(ctx context.Context, name string, callback func([]registry.Endpoint), onError func(err error)) {
 	p := r.kvPrefix(name)
 	backoff := retryBase
 	for ctx.Err() == nil && r.ctx.Err() == nil {
@@ -388,6 +418,7 @@ func (r *Registry) watchLoop(ctx context.Context, name string, callback func([]r
 				return
 			}
 			r.log.Warn("etcd registry: initial get failed", "name", name, "err", err)
+			r.reportErr(onError, err)
 			if !r.sleepCtx(ctx, backoff) {
 				return
 			}
@@ -398,7 +429,7 @@ func (r *Registry) watchLoop(ctx context.Context, name string, callback func([]r
 		r.deliver(callback, r.snapshotOf(state))
 
 		watchCh := r.client.Watch(ctx, p, clientv3.WithPrefix(), clientv3.WithRev(rev+1))
-		r.pump(ctx, p, watchCh, state, callback)
+		r.pump(ctx, p, watchCh, state, callback, onError)
 		if ctx.Err() != nil || r.ctx.Err() != nil {
 			return
 		}
@@ -408,15 +439,35 @@ func (r *Registry) watchLoop(ctx context.Context, name string, callback func([]r
 	}
 }
 
-func (r *Registry) pump(ctx context.Context, p string, watchCh clientv3.WatchChan, state map[string]registry.Endpoint, callback func([]registry.Endpoint)) {
+// reportErr 异步错误上抛，回调 panic 隔离。
+func (r *Registry) reportErr(onError func(err error), err error) {
+	if onError == nil {
+		return
+	}
+	defer func() {
+		if rec := recover(); rec != nil {
+			r.log.Error("etcd registry: watcher error callback panic", "panic", rec)
+		}
+	}()
+	onError(err)
+}
+
+func (r *Registry) pump(ctx context.Context, p string, watchCh clientv3.WatchChan, state map[string]registry.Endpoint, callback func([]registry.Endpoint), onError func(err error)) {
+	// 关闭收尾不算健康度错误；其余断流原因上抛后由外层重同步
 	for {
 		select {
 		case watchResp, ok := <-watchCh:
 			if !ok {
+				if ctx.Err() == nil && r.ctx.Err() == nil {
+					r.reportErr(onError, errors.New("etcd registry: watch channel closed"))
+				}
 				return
 			}
 			if err := watchResp.Err(); err != nil {
 				r.log.Warn("etcd registry: watch interrupted, resync", "prefix", p, "err", err)
+				if ctx.Err() == nil && r.ctx.Err() == nil {
+					r.reportErr(onError, err)
+				}
 				return
 			}
 			r.apply(p, state, watchResp.Events)
@@ -425,10 +476,16 @@ func (r *Registry) pump(ctx context.Context, p string, watchCh clientv3.WatchCha
 				select {
 				case wresp2, ok2 := <-watchCh:
 					if !ok2 {
+						if ctx.Err() == nil && r.ctx.Err() == nil {
+							r.reportErr(onError, errors.New("etcd registry: watch channel closed"))
+						}
 						return
 					}
 					if err := wresp2.Err(); err != nil {
 						r.log.Warn("etcd registry: watch interrupted, resync", "prefix", p, "err", err)
+						if ctx.Err() == nil && r.ctx.Err() == nil {
+							r.reportErr(onError, err)
+						}
 						return
 					}
 					r.apply(p, state, wresp2.Events)

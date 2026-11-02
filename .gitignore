@@ -2,6 +2,9 @@
 .idea/
 .vscode/
 
+# 本地工具报告（dsh ACL 巡检输出等）
+.dsh-acl-report/
+
 # Go
 *.exe
 *.exe~

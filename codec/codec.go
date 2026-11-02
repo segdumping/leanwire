@@ -11,13 +11,10 @@ import (
 var ErrTooLarge = errors.New("message too large")
 
 const (
-	// ReservedIDMin 保留段下界（含）
 	ReservedIDMin uint32 = 0xF000
-	// ReservedIDMax 保留段上界（含）
 	ReservedIDMax uint32 = 0xFFFF
 )
 
-// 保留消息号：插件从此处取号，勿在各自包内散落魔数。
 const (
 	IDHeartbeat uint32 = 0xF001
 	IDRPC       uint32 = 0xF002
@@ -29,7 +26,7 @@ func IsReserved(id uint32) bool { return id >= ReservedIDMin && id <= ReservedID
 
 type Msg struct {
 	ID   uint32
-	Body []byte // Send 之后不可修改
+	Body []byte
 }
 
 type Codec interface {

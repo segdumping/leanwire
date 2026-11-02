@@ -18,11 +18,14 @@ type Conn struct {
 	pending []byte
 }
 
-const DefaultReadLimit = 64*1024 + 8
+// DefaultReadLimit 需覆盖 codec-aes 默认 100KB 整帧的消息上限：
+// 同一配置在 TCP 上合法的整帧经 ws 转载不能被对端超限拒掉。
+const DefaultReadLimit = 100*1024 + 8
 
 const (
 	acceptQueue          = 4
 	defaultHeaderTimeout = 10 * time.Second
+	acceptWait           = 5 * time.Second // accept 队列满时的阻塞上限，超时收尾连接
 )
 
 func Adapt(c *websocket.Conn) net.Conn { return AdaptWithLimit(c, DefaultReadLimit) }
@@ -131,8 +134,13 @@ func (l *listener) handler() http.Handler {
 		if err != nil {
 			return
 		}
+		timer := time.NewTimer(acceptWait)
+		defer timer.Stop()
+		// 队列满时有界阻塞等待；超时收尾连接，避免升级协程无背压地卡死到关闭
 		select {
 		case l.ch <- Adapt(wsConn):
+		case <-timer.C:
+			_ = wsConn.Close()
 		case <-l.done:
 			_ = wsConn.Close()
 		}

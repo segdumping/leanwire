@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/quic-go/quic-go"
+
 	"github.com/segdumping/leanwire/codec"
 	"github.com/segdumping/leanwire/ext/router"
 	"github.com/segdumping/leanwire/server"
@@ -58,9 +60,10 @@ func quiet() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)
 // TestQUICParity 在环回 QUIC 上跑内核 echo。
 func TestQUICParity(t *testing.T) {
 	udpAvailable(t)
-	app := server.New(server.WithLogger(quiet()), server.WithIdleTimeout(time.Minute))
-	routeTable := router.Bind(app, router.WithLogger(quiet()))
-	routeTable.Handle(1, func(s *server.Conn, m codec.Msg) { _ = s.Send(m) })
+	routeTable := router.New(router.WithLogger(quiet()))
+	app := server.New(server.WithLogger(quiet()), server.WithIdleTimeout(time.Minute), server.WithRootHandler(routeTable.Handler()))
+	routeTable.Attach(app)
+	routeTable.Handle(1, func(s *server.Conn, m codec.Msg) { _ = s.Send(nil, m) })
 
 	serverTLS := &tls.Config{
 		Certificates: []tls.Certificate{selfSigned(t)},
@@ -129,6 +132,18 @@ func udpAvailable(t *testing.T) {
 	t.Skip("udp loopback unusable in this environment")
 }
 
+// 缺省参数：KeepAlivePeriod 15s；WithConfig 为整套替换（KeepAlivePeriod 0 即禁用保活）。
+func TestConfigDefaults(t *testing.T) {
+	cfg := newConfig(nil)
+	if cfg.KeepAlivePeriod != defaultKeepAlive {
+		t.Fatalf("KeepAlivePeriod = %v, want %v", cfg.KeepAlivePeriod, defaultKeepAlive)
+	}
+	cfg = newConfig([]Option{WithConfig(&quic.Config{MaxIdleTimeout: time.Second})})
+	if cfg.MaxIdleTimeout != time.Second || cfg.KeepAlivePeriod != 0 {
+		t.Fatalf("WithConfig not applied: %+v", cfg)
+	}
+}
+
 func udpRoundTrip(t *testing.T) bool {
 	t.Helper()
 	ua, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
@@ -183,5 +198,65 @@ func udpRoundTrip(t *testing.T) bool {
 		return ok
 	case <-time.After(2 * time.Second):
 		return false
+	}
+}
+
+// 缺省配置启用保活：静默超过对端 MaxIdleTimeout 的连接不被 QUIC 传输层关断。
+func TestQUICSilenceKeptAlive(t *testing.T) {
+	udpAvailable(t)
+	routeTable := router.New(router.WithLogger(quiet()))
+	app := server.New(server.WithLogger(quiet()), server.WithIdleTimeout(time.Minute), server.WithRootHandler(routeTable.Handler()))
+	routeTable.Attach(app)
+	routeTable.Handle(1, func(s *server.Conn, m codec.Msg) { _ = s.Send(nil, m) })
+
+	serverTLS := &tls.Config{
+		Certificates: []tls.Certificate{selfSigned(t)},
+		NextProtos:   []string{alpn},
+		MinVersion:   tls.VersionTLS13,
+	}
+	// 服务端 MaxIdleTimeout=2s：对端若不保活，静默 2s 内必被关断
+	listener, err := Listen("127.0.0.1:0", serverTLS, WithConfig(&quic.Config{MaxIdleTimeout: 2 * time.Second}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+	app.Serve(listener)
+
+	clientTLS := &tls.Config{
+		InsecureSkipVerify: true, // 自签测试证书
+		NextProtos:         []string{alpn},
+		MinVersion:         tls.VersionTLS13,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cliConn, err := Dial(ctx, listener.Addr().String(), clientTLS) // 缺省 opts：KeepAlivePeriod 15s
+	skipIfEnvBlocked(t, err, "handshake")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.Connect(cliConn); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(3300 * time.Millisecond) // 静默 > 服务端 MaxIdleTimeout(2s)
+
+	c := codec.DefaultCodec(64 * 1024)
+	if err := c.WriteMsg(cliConn, codec.Msg{ID: 1, Body: []byte("alive")}); err != nil {
+		t.Fatalf("write after silence: %v", err)
+	}
+	_ = cliConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	m, err := c.ReadMsg(cliConn)
+	skipIfEnvBlocked(t, err, "transport")
+	if err != nil {
+		t.Fatalf("read after silence: %v", err)
+	}
+	if string(m.Body) != "alive" {
+		t.Fatalf("echo = %q, want alive", m.Body)
+	}
+
+	sctx, scancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer scancel()
+	if err := app.Shutdown(sctx); err != nil {
+		t.Fatalf("shutdown: %v", err)
 	}
 }

@@ -8,10 +8,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"go/parser"
+	"go/token"
 	"io"
 	"log/slog"
 	"math/big"
 	"net"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -67,17 +71,19 @@ type testTable struct {
 	handlers map[uint32]HandlerFunc
 }
 
-func newTestTable(server *Server) *testTable {
+func newTestServer(opts ...Option) (*Server, *testTable) {
 	table := &testTable{handlers: make(map[uint32]HandlerFunc)}
-	server.SetRootHandler(func(c *Conn, m codec.Msg) {
-		table.mu.RLock()
-		h := table.handlers[m.ID]
-		table.mu.RUnlock()
-		if h != nil {
-			h(c, m)
-		}
-	})
-	return table
+	opts = append(opts, WithRootHandler(table.dispatch))
+	return New(opts...), table
+}
+
+func (table *testTable) dispatch(c *Conn, m codec.Msg) {
+	table.mu.RLock()
+	h := table.handlers[m.ID]
+	table.mu.RUnlock()
+	if h != nil {
+		h(c, m)
+	}
 }
 
 func (table *testTable) Handle(id uint32, h HandlerFunc) {
@@ -95,15 +101,14 @@ func TestShutdownOrder(t *testing.T) {
 	var onCloseReason error
 	onCloseOnce := sync.Once{}
 
-	server := New(WithIdleTimeout(time.Minute), WithHooks(Hooks{
+	server, tt := newTestServer(WithIdleTimeout(time.Minute), WithHooks(Hooks{
 		OnClose: func(s *Conn, err error) {
 			onCloseOnce.Do(func() { onCloseReason = err })
 		},
 	}))
-	tt := newTestTable(server)
 	tt.Handle(1, func(s *Conn, m codec.Msg) {
 		// 停止前已入队的消息必须在关连接前写出
-		hookSendErr = s.Send(codec.Msg{ID: 2, Body: []byte("bye")})
+		hookSendErr = s.Send(nil, codec.Msg{ID: 2, Body: []byte("bye")})
 		<-block // 模拟在途 handler
 		handlerDone = time.Now()
 	})
@@ -197,12 +202,11 @@ func TestTLSParity(t *testing.T) {
 
 	openCh := make(chan *Conn, 1)
 	reasonCh := make(chan error, 1)
-	server := New(WithIdleTimeout(time.Minute), WithLogger(quietLogger()), WithHooks(Hooks{
+	server, tt := newTestServer(WithIdleTimeout(time.Minute), WithLogger(quietLogger()), WithHooks(Hooks{
 		OnOpen:  func(s *Conn) { openCh <- s },
 		OnClose: func(s *Conn, err error) { reasonCh <- err },
 	}))
-	tt := newTestTable(server)
-	tt.Handle(1, func(s *Conn, m codec.Msg) { _ = s.Send(m) })
+	tt.Handle(1, func(s *Conn, m codec.Msg) { _ = s.Send(nil, m) })
 
 	tcpLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -273,9 +277,8 @@ func TestTLSPipeParity(t *testing.T) {
 	cert := selfSignedCertificate(t)
 	serverTLS := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
 
-	server := New(WithIdleTimeout(time.Minute), WithLogger(quietLogger()))
-	tt := newTestTable(server)
-	tt.Handle(7, func(s *Conn, m codec.Msg) { _ = s.Send(m) })
+	server, tt := newTestServer(WithIdleTimeout(time.Minute), WithLogger(quietLogger()))
+	tt.Handle(7, func(s *Conn, m codec.Msg) { _ = s.Send(nil, m) })
 
 	srvRaw, cliRaw := net.Pipe()
 	srvTLS := tls.Server(srvRaw, serverTLS)
@@ -314,5 +317,41 @@ func TestTLSPipeParity(t *testing.T) {
 	case <-clientErr:
 	case <-time.After(2 * time.Second):
 		t.Fatal("client did not observe connection close")
+	}
+}
+
+// TestKernelContract 机检内核契约：server 只允许依赖内核 codec（加标准库），
+// 不得引用 app/ 或 ext/ 任何插件，保证"插件可删除"的承诺可机检。
+func TestKernelContract(t *testing.T) {
+	entries, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	for _, path := range entries {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		for _, im := range f.Imports {
+			p := strings.Trim(im.Path.Value, `"`)
+			if !strings.Contains(p, "segdumping/leanwire") {
+				continue
+			}
+			if p != "github.com/segdumping/leanwire/codec" {
+				t.Errorf("%s imports %s: kernel server may only depend on codec", path, p)
+			}
+		}
+	}
+}
+
+// 0 关闭空闲超时。
+func TestIdleTimeoutDisabled(t *testing.T) {
+	server := New(WithIdleTimeout(0), WithLogger(quietLogger()))
+	if server.config.idle != 0 {
+		t.Fatalf("idle = %v, want 0", server.config.idle)
 	}
 }

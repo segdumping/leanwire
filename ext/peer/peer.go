@@ -1,6 +1,7 @@
 package peer
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"math/rand/v2"
@@ -18,7 +19,7 @@ const (
 
 type Reconn struct {
 	appServer *server.Server
-	dial      func() (net.Conn, error)
+	dial      func(ctx context.Context) (net.Conn, error)
 
 	onConnected    func(*server.Conn)
 	onDisconnected func(*server.Conn)
@@ -29,6 +30,8 @@ type Reconn struct {
 
 	log *slog.Logger
 
+	ctx       context.Context
+	cancel    context.CancelFunc
 	stopOnce  sync.Once
 	startOnce sync.Once
 	stopCh    chan struct{}
@@ -62,7 +65,7 @@ func WithOnFailed(f func(err error)) Option { return func(r *Reconn) { r.onFaile
 // WithLogger 设置日志器。
 func WithLogger(l *slog.Logger) Option { return func(r *Reconn) { r.log = l } }
 
-func New(appServer *server.Server, dial func() (net.Conn, error), opts ...Option) *Reconn {
+func New(appServer *server.Server, dial func(ctx context.Context) (net.Conn, error), opts ...Option) *Reconn {
 	r := &Reconn{
 		appServer: appServer,
 		dial:      dial,
@@ -80,14 +83,21 @@ func New(appServer *server.Server, dial func() (net.Conn, error), opts ...Option
 	if r.log == nil {
 		r.log = slog.Default()
 	}
+	// r.ctx 由 Stop 取消：挂死的拨号也能被中断。
+	r.ctx, r.cancel = context.WithCancel(context.Background())
 	return r
 }
 
 // Start 启动重连循环，可重复调用。
 func (r *Reconn) Start() { r.startOnce.Do(func() { go r.loop() }) }
 
-// Stop 停止后续重拨，不关闭当前连接。
-func (r *Reconn) Stop() { r.stopOnce.Do(func() { close(r.stopCh) }) }
+// Stop 停止后续重拨并取消在途拨号（ctx 取消），不关闭当前连接。
+func (r *Reconn) Stop() {
+	r.stopOnce.Do(func() {
+		close(r.stopCh)
+		r.cancel()
+	})
+}
 
 func (r *Reconn) loop() {
 	delay := r.minDelay
@@ -98,8 +108,11 @@ func (r *Reconn) loop() {
 		default:
 		}
 
-		conn, err := r.dial()
+		conn, err := r.dial(r.ctx)
 		if err != nil {
+			if r.ctx.Err() != nil { // Stop 取消拨号：静默退出，不当作失败
+				return
+			}
 			r.fail(err)
 			if !r.sleep(delay) {
 				return

@@ -76,7 +76,7 @@ func TestSessionAndReasonCounters(t *testing.T) {
 			}
 		}
 	}()
-	if err := s2.Send(codec.Msg{ID: 1}); err != nil {
+	if err := s2.Send(nil, codec.Msg{ID: 1}); err != nil {
 		t.Fatal(err)
 	}
 	s2.Close()

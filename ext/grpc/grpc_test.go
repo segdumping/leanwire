@@ -62,7 +62,7 @@ func TestGRPCParity(t *testing.T) {
 				}
 			},
 		}))
-	routeTable.Handle(1, func(s *server.Conn, m codec.Msg) { _ = s.Send(m) })
+	routeTable.Handle(1, func(s *server.Conn, m codec.Msg) { _ = s.Send(nil, m) })
 
 	listener, stop := startServer(t)
 	a.Serve(listener)
@@ -273,7 +273,7 @@ func TestGRPCHalfOpenWriteDeadline(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("server session not opened")
 	}
-	if err := s.Send(codec.Msg{ID: 1, Body: make([]byte, 8<<20)}); err != nil {
+	if err := s.Send(nil, codec.Msg{ID: 1, Body: make([]byte, 8<<20)}); err != nil {
 		t.Fatalf("send: %v", err)
 	}
 
@@ -285,7 +285,7 @@ func TestGRPCHalfOpenWriteDeadline(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("half-open write deadline did not fire")
 	}
-	if err := s.Send(codec.Msg{ID: 1}); err != server.ErrClosed {
+	if err := s.Send(nil, codec.Msg{ID: 1}); err != server.ErrClosed {
 		t.Fatalf("send after write-timeout close: want ErrClosed, got %v", err)
 	}
 
@@ -295,4 +295,190 @@ func TestGRPCHalfOpenWriteDeadline(t *testing.T) {
 		t.Fatalf("shutdown: %v", err)
 	}
 	stop()
+}
+
+// 写超时可重试：过期 deadline 返回超时错误但不封连接不记 lastErr，
+// 恢复 deadline 后连接仍可用（对齐 net.Conn deadline 语义）。
+func TestGRPCWriteDeadlineRetry(t *testing.T) {
+	msgCh := make(chan codec.Msg, 8)
+	routeTable := router.New(router.WithLogger(quiet()))
+	a := server.New(server.WithLogger(quiet()), server.WithIdleTimeout(time.Minute),
+		server.WithRootHandler(routeTable.Handler()))
+	routeTable.Handle(1, func(_ *server.Conn, m codec.Msg) {
+		msgCh <- m
+	})
+	listener, stop := startServer(t)
+	a.Serve(listener)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, listener.Addr().String(), ggrpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	// 写超时：返回超时错误，但连接不关闭
+	c := codec.DefaultCodec(64 * 1024)
+	frame := func(body string) []byte {
+		var b bytes.Buffer
+		if err := c.WriteMsg(&b, codec.Msg{ID: 1, Body: []byte(body)}); err != nil {
+			t.Fatal(err)
+		}
+		return b.Bytes()
+	}
+	if err := client.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Write(frame("late")); err != (deadlineError{}) {
+		t.Fatalf("err = %v, want deadlineError", err)
+	}
+
+	// 恢复 deadline：重试成功
+	if err := client.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Write(frame("ok")); err != nil {
+		t.Fatalf("retry after deadline: %v", err)
+	}
+
+	// 流仍存活：服务端应收到消息
+	select {
+	case m := <-msgCh:
+		if string(m.Body) != "ok" {
+			t.Fatalf("body = %q", m.Body)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("stream broken by write deadline")
+	}
+
+	sctx, scancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer scancel()
+	if err := a.Shutdown(sctx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	stop()
+}
+
+// 阻塞流：SendMsg 卡在 release 上模拟对端流控停滞，RecvMsg 供 pump 挂起。
+type stuckStream struct{ release chan struct{} }
+
+func (s *stuckStream) SendMsg(any) error { <-s.release; return nil }
+func (s *stuckStream) RecvMsg(any) error { <-s.release; return io.EOF }
+
+// 写超时后重试：在途 SendMsg 卡住仍持槽位时，重试的 Write 必须受 deadline
+// 约束到点返回超时，而不是无限阻塞在槽位等待上。
+func TestGRPCWriteDeadlineSlotWait(t *testing.T) {
+	release := make(chan struct{})
+	c := newConn(&stuckStream{release: release}, nil, nil)
+	t.Cleanup(func() {
+		close(release) // 解开在途 SendMsg 与 pump
+		_ = c.Close()
+	})
+
+	// 首次写（无 deadline）：SendMsg 进入在途并卡住，持有槽位
+	go func() { _, _ = c.Write([]byte("first")) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for len(c.sendSlot) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("in-flight send never acquired the slot")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// 重试写：带 deadline，必须到点返回超时而不是永远等槽
+	if err := c.SetWriteDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Write([]byte("second"))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != (deadlineError{}) {
+			t.Fatalf("retry write err = %v, want deadlineError", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("retry write blocked past deadline: slot wait ignores write deadline")
+	}
+}
+
+// 拨号 ctx 独立性：流建立后取消拨号 ctx 不应随断连接（外部短超时 ctx 拨号用法）。
+func TestGRPCDialCtxIndependent(t *testing.T) {
+	routeTable := router.New(router.WithLogger(quiet()))
+	a := server.New(server.WithLogger(quiet()), server.WithIdleTimeout(time.Minute),
+		server.WithRootHandler(routeTable.Handler()))
+	routeTable.Handle(1, func(s *server.Conn, m codec.Msg) { _ = s.Send(nil, m) })
+	listener, stop := startServer(t)
+	a.Serve(listener)
+
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	client, err := Dial(dialCtx, listener.Addr().String(), ggrpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		dialCancel()
+		t.Fatal(err)
+	}
+	dialCancel() // 立即取消拨号 ctx：已建立的流必须继续存活
+	defer client.Close()
+
+	c := codec.DefaultCodec(64 * 1024)
+	var buffer bytes.Buffer
+	if err := c.WriteMsg(&buffer, codec.Msg{ID: 1, Body: []byte("ping")}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := client.Write(buffer.Bytes()); err != nil {
+		t.Fatalf("write after dial ctx cancel: %v", err)
+	}
+
+	_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	m, err := c.ReadMsg(client)
+	if err != nil || string(m.Body) != "ping" {
+		t.Fatalf("read: %v, %q", err, m.Body)
+	}
+
+	sctx, scancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer scancel()
+	if err := a.Shutdown(sctx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	stop()
+}
+
+// accept 队列满：有界阻塞等待，超时返回 false（调用方回 ResourceExhausted）；关闭后立即拒绝。
+func TestListenerAdoptQueueFull(t *testing.T) {
+	saved := adoptWait
+	adoptWait = 50 * time.Millisecond
+	defer func() { adoptWait = saved }()
+
+	l := NewListener(nil)
+	defer func() { _ = l.Close() }()
+	var cleanup []func()
+	defer func() {
+		for _, fn := range cleanup {
+			fn()
+		}
+	}()
+	for i := 0; i < acceptQueue; i++ {
+		aEnd, bEnd := net.Pipe()
+		cleanup = append(cleanup, func() { _ = aEnd.Close(); _ = bEnd.Close() })
+		if !l.adoptConn(aEnd) {
+			t.Fatalf("conn #%d rejected before queue full", i)
+		}
+	}
+	aEnd, bEnd := net.Pipe()
+	defer func() { _ = aEnd.Close(); _ = bEnd.Close() }()
+	if l.adoptConn(aEnd) {
+		t.Fatal("queue-full adopt should block and time out, not enqueue")
+	}
+	// 关闭后必须立即拒绝
+	_ = l.Close()
+	start := time.Now()
+	if l.adoptConn(aEnd) {
+		t.Fatal("after close must reject")
+	}
+	if d := time.Since(start); d > 100*time.Millisecond {
+		t.Fatalf("close did not unblock promptly: %v", d)
+	}
 }

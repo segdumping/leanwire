@@ -47,45 +47,35 @@ func (s *Conn) RemoteAddr() net.Addr  { return s.conn.RemoteAddr() }
 func (s *Conn) Done() <-chan struct{} { return s.done }
 func (s *Conn) closeDone()            { close(s.done) }
 
-// Send 阻塞至入队成功或 flush 超时；关闭后返回 ErrClosed。
-func (s *Conn) Send(m codec.Msg) (err error) {
+// Send 阻塞至入队成功、连接关闭或 ctx 到期
+func (s *Conn) Send(ctx context.Context, m codec.Msg) (err error) {
 	if s.closed.Load() {
 		return ErrClosed
 	}
 	defer func() {
 		if recover() != nil {
-			err = ErrClosed // Close 并发关闭了 out
+			err = ErrClosed
 		}
 	}()
+
+	// 先试一次非阻塞入队
 	select {
 	case s.out <- m:
 		return nil
 	default:
 	}
 
-	t := time.NewTimer(s.conf.flush)
-	defer t.Stop()
-	select {
-	case s.out <- m:
-		return nil
-	case <-t.C:
-		return ErrTimeout
-	}
-}
-
-// SendWait 阻塞至入队、连接关闭或 ctx 到期；nil ctx 等价于 Send。
-func (s *Conn) SendWait(ctx context.Context, m codec.Msg) (err error) {
 	if ctx == nil {
-		return s.Send(m)
-	}
-	if s.closed.Load() {
-		return ErrClosed
-	}
-	defer func() {
-		if recover() != nil {
-			err = ErrClosed // Close 并发关闭了 out
+		t := time.NewTimer(s.conf.flush)
+		defer t.Stop()
+		select {
+		case s.out <- m:
+			return nil
+		case <-t.C:
+			return ErrTimeout
 		}
-	}()
+	}
+
 	select {
 	case s.out <- m:
 		return nil
@@ -94,14 +84,14 @@ func (s *Conn) SendWait(ctx context.Context, m codec.Msg) (err error) {
 	}
 }
 
-// TrySend 非阻塞：队列满丢弃本条并返回 ErrQueueFull，连接保持打开。
+// TrySend 非阻塞：队列满丢弃
 func (s *Conn) TrySend(m codec.Msg) (err error) {
 	if s.closed.Load() {
 		return ErrClosed
 	}
 	defer func() {
 		if recover() != nil {
-			err = ErrClosed // Close 并发关闭了 out
+			err = ErrClosed
 		}
 	}()
 	select {
@@ -123,19 +113,17 @@ func (s *Conn) writeLoop(setReason func(error)) {
 	defer s.conn.Close()
 	defer s.Close()
 
-	var drainDeadline time.Time
+	var drainBy time.Time // 零值 = 尚未进入排空
 	for m := range s.out {
-		s.conf.log.Debug("msg out", "conn", s.id, "msgID", m.ID, "n", len(m.Body), "remote", s.conn.RemoteAddr())
-		if s.closed.Load() && drainDeadline.IsZero() {
-			drainDeadline = time.Now().Add(s.conf.flush)
-		}
-		if !drainDeadline.IsZero() && !time.Now().Before(drainDeadline) {
-			return
-		}
-
 		deadline := time.Now().Add(s.conf.flush)
-		if !drainDeadline.IsZero() && drainDeadline.Before(deadline) {
-			deadline = drainDeadline
+		if s.closed.Load() {
+			if drainBy.IsZero() {
+				drainBy = deadline
+			}
+			deadline = drainBy
+			if !deadline.After(time.Now()) {
+				return
+			}
 		}
 		if err := s.conn.SetWriteDeadline(deadline); err != nil {
 			setReason(err)
@@ -149,15 +137,6 @@ func (s *Conn) writeLoop(setReason func(error)) {
 			setReason(err)
 			return
 		}
-	}
-
-	deadline := time.Now().Add(s.conf.flush)
-	if !drainDeadline.IsZero() && drainDeadline.Before(deadline) {
-		deadline = drainDeadline
-	}
-	_ = s.conn.SetWriteDeadline(deadline)
-	if err := s.bw.Flush(); err != nil {
-		setReason(err)
 	}
 }
 
@@ -194,7 +173,6 @@ func (s *Conn) readLoop(stopping func() bool, setReason func(error)) {
 			}
 			return
 		}
-		s.conf.log.Debug("msg in", "conn", s.id, "msgID", m.ID, "n", len(m.Body), "remote", s.conn.RemoteAddr())
 
 		if root := s.conf.rootHandler; root != nil {
 			s.runHandler(root, m)

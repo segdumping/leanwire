@@ -104,7 +104,7 @@ func TestEndToEnd(t *testing.T) {
 	defer reg.Close()
 
 	serverApp, _ := newServerApp(t, "service", WithRegistry(reg))
-	serverApp.Handle(1, func(s Session, body []byte) { _ = s.SendWaitBytes(context.Background(), 1, body) })
+	serverApp.Handle(1, func(s Session, body []byte) { _ = s.SendBytes(context.Background(), 1, body) })
 	handleRPC(serverApp, 2, func(body []byte, reply rpc.Reply) {
 		_ = reply(append([]byte("pong:"), body...), nil)
 	})
@@ -239,6 +239,9 @@ func TestNoDirectory(t *testing.T) {
 	if !errors.Is(service.WaitReady(context.Background()), ErrNoDirectory) {
 		t.Fatal("want ErrNoDirectory from WaitReady")
 	}
+	if !errors.Is(service.WaitConnected(context.Background()), ErrNoDirectory) {
+		t.Fatal("want ErrNoDirectory from WaitConnected")
+	}
 	if err := service.Send(context.Background(), 1, nil); !errors.Is(err, ErrNoDirectory) {
 		t.Fatalf("Send err = %v", err)
 	}
@@ -247,8 +250,8 @@ func TestNoDirectory(t *testing.T) {
 	}
 }
 
-// 请求无 handler：不回复，调用方按 ctx 超时（框架不设默认超时）。
-func TestCallTimeout(t *testing.T) {
+// 请求无 handler：对端回 no handler 错误，调用方快速失败而非悬挂到超时。
+func TestCallNoHandler(t *testing.T) {
 	serverApp, addr := newServerApp(t, "service") // 未注册 RPC handler(2)
 	runApp(serverApp)
 
@@ -260,10 +263,10 @@ func TestCallTimeout(t *testing.T) {
 	if err := service.WaitReady(ctx); err != nil {
 		t.Fatalf("WaitReady: %v", err)
 	}
-	timeoutContext, timeoutCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer timeoutCancel()
-	if _, err := service.Call(timeoutContext, 2, []byte("x")); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("err = %v, want DeadlineExceeded", err)
+	_, err := service.Call(ctx, 2, []byte("x"))
+	var e *rpc.RemoteError
+	if !errors.As(err, &e) || e.Code != 0 || e.Msg != "rpc: no handler" {
+		t.Fatalf("err = %v, want *rpc.RemoteError{0, rpc: no handler}", err)
 	}
 	clientApp.Exit()
 	waitDone(t, clientApp)
@@ -395,12 +398,12 @@ func TestDependAfterRun(t *testing.T) {
 	waitDone(t, clientApp)
 }
 
-// 启动序：OnStart 完成之前不会有任何入站回调执行。
+// 启动序：AppendStarting 完成之前不会有任何入站回调执行。
 func TestOnStartBeforeTraffic(t *testing.T) {
 	var ready atomic.Bool
 	var early atomic.Int32
 	a := New("service", WithLogger(quietLogger()))
-	a.OnStart(func(*App) {
+	a.AppendStarting(func(*App) {
 		time.Sleep(200 * time.Millisecond)
 		ready.Store(true)
 	})
@@ -437,8 +440,65 @@ func TestOnStartBeforeTraffic(t *testing.T) {
 	waitDone(t, a)
 }
 
-// 停止序：OnStop 按序 → 内核关闭 → OnFini 逆序。
-func TestOnFiniOrder(t *testing.T) {
+// 结论 1 的依赖方向：出站依赖在连接建立时即推送（对端 OnOpen 即发），
+// handler 仍必须晚于 OnStart 完成——ready 门控让早到帧在读侧阻塞等待。
+// TestOnStartBeforeTraffic 的服务端 accept 晚于门控打开，删除门控也照样
+// 通过；本测试的流量在 OnStart 睡眠期间已在途，能真实捕获门控回归。
+func TestOnStartGateCoversDependencyTraffic(t *testing.T) {
+	// 对端（裸内核）：OnOpen 立即推送 msgID=1
+	peer := server.New(server.WithLogger(quietLogger()),
+		server.WithHooks(server.Hooks{
+			OnOpen: func(s *server.Conn) {
+				_ = s.Send(nil, codec.Msg{ID: 1, Body: []byte("early")})
+			},
+		}))
+	peerListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer.Serve(peerListener)
+	t.Cleanup(func() {
+		sctx, scancel := context.WithTimeout(context.Background(), time.Second)
+		defer scancel()
+		_ = peer.Shutdown(sctx)
+		_ = peerListener.Close()
+	})
+
+	a := New("client", WithLogger(quietLogger()))
+	var ready atomic.Bool
+	var early atomic.Int32
+	fired := make(chan struct{}, 4)
+	a.AppendStarting(func(*App) {
+		time.Sleep(300 * time.Millisecond)
+		ready.Store(true)
+	})
+	a.Handle(1, func(_ Session, _ []byte) {
+		if !ready.Load() {
+			early.Add(1)
+		}
+		fired <- struct{}{}
+	})
+	service := a.Depend("peer", WithAddress(peerListener.Addr().String()), WithBackoff(20*time.Millisecond, 100*time.Millisecond))
+	runApp(a)
+
+	ctx := ctxTimeout(t, 3*time.Second)
+	if err := service.WaitReady(ctx); err != nil {
+		t.Fatalf("WaitReady: %v", err)
+	}
+	select {
+	case <-fired:
+	case <-ctx.Done():
+		t.Fatal("pushed frame never dispatched")
+	}
+	if early.Load() != 0 {
+		t.Fatalf("%d handlers ran before OnStart finished", early.Load())
+	}
+	a.Exit()
+	waitDone(t, a)
+}
+
+// 停止序：AppendStopping 按序 → 内核关闭 → AppendStopped 逆序。
+func TestAppendStoppedOrder(t *testing.T) {
 	a := New("x", WithLogger(quietLogger()))
 	var mu sync.Mutex
 	var order []string
@@ -449,10 +509,10 @@ func TestOnFiniOrder(t *testing.T) {
 			mu.Unlock()
 		}
 	}
-	a.OnStop(rec("stop1"))
-	a.OnStop(rec("stop2"))
-	a.OnFini(rec("fini1"))
-	a.OnFini(rec("fini2"))
+	a.AppendStopping(rec("stop1"))
+	a.AppendStopping(rec("stop2"))
+	a.AppendStopped(rec("fini1"))
+	a.AppendStopped(rec("fini2"))
 	runApp(a)
 	for !a.started.Load() {
 		time.Sleep(time.Millisecond)
@@ -482,7 +542,7 @@ func TestExitRejectsCalls(t *testing.T) {
 		_ = reply([]byte("ok"), nil)
 	})
 	entered := make(chan struct{})
-	a.OnStop(func(*App) {
+	a.AppendStopping(func(*App) {
 		close(entered)
 		time.Sleep(200 * time.Millisecond) // 期间会有请求到达
 	})
@@ -623,7 +683,7 @@ registered:
 // 同连接消息严格保序：单连接 100 条回显按序返回（handler 内联执行）。
 func TestInboundOrderPerConn(t *testing.T) {
 	a, addr := newServerApp(t, "service")
-	a.Handle(1, func(s Session, body []byte) { _ = s.SendWaitBytes(context.Background(), 1, body) })
+	a.Handle(1, func(s Session, body []byte) { _ = s.SendBytes(context.Background(), 1, body) })
 	runApp(a)
 
 	c, err := net.Dial("tcp", addr)
@@ -675,9 +735,9 @@ func TestLifecycleGuards(t *testing.T) {
 	}
 	for _, f := range []func(){
 		func() { a.Handle(1, func(Session, []byte) {}) },
-		func() { a.OnStart(func(*App) {}) },
-		func() { a.OnStop(func(*App) {}) },
-		func() { a.OnFini(func(*App) {}) },
+		func() { a.AppendStarting(func(*App) {}) },
+		func() { a.AppendStopping(func(*App) {}) },
+		func() { a.AppendStopped(func(*App) {}) },
 		func() { _ = a.Listen("127.0.0.1:0") },
 	} {
 		func() {
@@ -928,4 +988,165 @@ func TestAppMustHandlePanics(t *testing.T) {
 	// 宽松版不受影响。
 	a.Handle(3, func(Session, []byte) {})
 	a.RPC().Handle(4, h)
+}
+
+// OnStart 钩子内使用出站依赖：依赖在钩子前已启动，可同步调用并取得回包。
+func TestOnStartOutboundCall(t *testing.T) {
+	serverApp, addr := newServerApp(t, "service")
+	handleRPC(serverApp, 2, func(_ []byte, reply rpc.Reply) { _ = reply([]byte("in-start"), nil) })
+	runApp(serverApp)
+
+	a := New("client", WithLogger(quietLogger()))
+	service := a.Depend("service", WithAddress(addr), WithBackoff(20*time.Millisecond, 100*time.Millisecond))
+	var resp []byte
+	var callErr error
+	a.AppendStarting(func(*App) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := service.WaitReady(ctx); err != nil {
+			callErr = err
+			return
+		}
+		resp, callErr = service.Call(ctx, 2, nil)
+	})
+	runApp(a)
+
+	// Post 在 ready 门控之后执行，等它即等 OnStart 完成。
+	started := make(chan struct{})
+	if !a.Post(func() { close(started) }) {
+		t.Fatal("post after run failed")
+	}
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("app not started in time")
+	}
+	if callErr != nil || string(resp) != "in-start" {
+		t.Fatalf("call in OnStart = %q, %v", resp, callErr)
+	}
+	a.Exit()
+	waitDone(t, a)
+}
+
+// WithWorkers：不同连接的入站回调并行执行（key 为连接 ID，落到不同 worker）；
+// 默认单 worker 会串行化，第一路悬挂，测试在等待第二路上超时。
+func TestWorkersRunInParallel(t *testing.T) {
+	a, addr := newServerApp(t, "service", WithWorkers(2))
+	arrive := make(chan struct{}, 2)
+	release := make(chan struct{})
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+	a.Handle(1, func(Session, []byte) {
+		arrive <- struct{}{}
+		select {
+		case <-release:
+		case <-stop:
+		}
+	})
+	runApp(a)
+
+	// 两条裸 TCP 连接：只消耗服务端 accept 的连接 ID，相邻 ID 必落到不同
+	// worker。若改用 app.Client（另有客户端 Connect 也消耗全局连接 ID），
+	// 服务端 ID 恒差 2，同奇偶在 n=2 下会同分片。
+	cdec := codec.DefaultCodec(64 * 1024)
+	var conns []net.Conn
+	defer func() {
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	}()
+	for i := 0; i < 2; i++ {
+		var c net.Conn
+		var err error
+		for attempt := 0; attempt < 100; attempt++ { // 等 Run 起听
+			if c, err = net.Dial("tcp", addr); err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		conns = append(conns, c)
+	}
+	for _, c := range conns {
+		if err := cdec.WriteMsg(c, codec.Msg{ID: 1, Body: []byte("x")}); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-arrive:
+		case <-time.After(3 * time.Second):
+			t.Fatal("handlers did not run in parallel across connections")
+		}
+	}
+	close(release) // 两路都已停在 handler 内：并行成立，放行
+
+	a.Exit()
+	waitDone(t, a)
+}
+
+// WaitConnected：断线后阻塞，重连完成即返回；与 WaitReady 的首次语义互补。
+func TestWaitConnected(t *testing.T) {
+	ln1, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln1.Addr().String()
+
+	serverApp := New("service", WithLogger(quietLogger()))
+	handleRPC(serverApp, 2, func(_ []byte, reply rpc.Reply) { _ = reply([]byte("ok"), nil) })
+	serverApp.Serve(ln1)
+	runApp(serverApp)
+
+	clientApp := New("client", WithLogger(quietLogger()))
+	service := clientApp.Depend("service", WithAddress(addr), WithBackoff(20*time.Millisecond, 100*time.Millisecond))
+	runApp(clientApp)
+
+	ctx := ctxTimeout(t, 3*time.Second)
+	if err := service.WaitReady(ctx); err != nil {
+		t.Fatalf("WaitReady: %v", err)
+	}
+	if err := service.WaitConnected(ctx); err != nil {
+		t.Fatalf("WaitConnected (up): %v", err)
+	}
+
+	// 对端停止 → 连接断开；短窗口内 WaitConnected 感知断开并阻塞。
+	serverApp.Exit()
+	waitDone(t, serverApp)
+	waitFor(t, 2*time.Second, func() bool { return !service.Available() })
+	downCtx, downCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer downCancel()
+	if err := service.WaitConnected(downCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitConnected (down) = %v, want deadline exceeded", err)
+	}
+
+	// 同址重启 → 重连完成，WaitConnected 返回 nil（lb 失败冷却会延后重拨，
+	// 等待窗口取 6s，同 TestLinkReconnect）。
+	var ln2 net.Listener
+	for i := 0; i < 50; i++ {
+		if ln2, err = net.Listen("tcp", addr); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("relisten %s: %v", addr, err)
+	}
+	serverApp2 := New("service", WithLogger(quietLogger()))
+	handleRPC(serverApp2, 2, func(_ []byte, reply rpc.Reply) { _ = reply([]byte("ok"), nil) })
+	serverApp2.Serve(ln2)
+	runApp(serverApp2)
+
+	reCtx, reCancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer reCancel()
+	if err := service.WaitConnected(reCtx); err != nil {
+		t.Fatalf("WaitConnected (reconnected): %v", err)
+	}
+
+	clientApp.Exit()
+	waitDone(t, clientApp)
+	serverApp2.Exit()
+	waitDone(t, serverApp2)
 }

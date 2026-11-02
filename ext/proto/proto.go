@@ -1,6 +1,7 @@
 package proto
 
 import (
+	"context"
 	"log/slog"
 
 	gproto "google.golang.org/protobuf/proto"
@@ -46,11 +47,11 @@ func Register[T any, PT PbOf[T]](routeTable *router.Router, id uint32, h func(s 
 	})
 }
 
-// Send 序列化并发送 protobuf 消息。
-func Send[T any, PT PbOf[T]](s *server.Conn, id uint32, m PT) error {
+// Send 序列化并发送 protobuf 消息；nil ctx 使用连接的 flush 超时兜底。
+func Send[T any, PT PbOf[T]](s *server.Conn, ctx context.Context, id uint32, m PT) error {
 	body, err := gproto.Marshal(m)
 	if err != nil {
 		return err
 	}
-	return s.Send(codec.Msg{ID: id, Body: body})
+	return s.Send(ctx, codec.Msg{ID: id, Body: body})
 }

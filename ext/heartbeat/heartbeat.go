@@ -28,8 +28,10 @@ type Option func(*Heartbeat)
 // WithID 指定 msgID，默认 0xF001。
 func WithID(id uint32) Option { return func(h *Heartbeat) { h.id = id } }
 
-// WithBody 指定心跳 body。
-func WithBody(b []byte) Option { return func(h *Heartbeat) { h.body = b } }
+// WithBody 指定心跳 body；拷贝入参，调用方事后修改不影响已外发的帧。
+func WithBody(b []byte) Option {
+	return func(h *Heartbeat) { h.body = append([]byte(nil), b...) }
+}
 
 func New(appServer *server.Server, every time.Duration, opts ...Option) *Heartbeat {
 	if every <= 0 {

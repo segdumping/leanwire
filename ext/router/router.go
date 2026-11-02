@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	"github.com/segdumping/leanwire/codec"
 	"github.com/segdumping/leanwire/server"
@@ -14,9 +15,9 @@ type table map[uint32]server.HandlerFunc
 type unknownFn func(s *server.Conn, m codec.Msg)
 
 type Router struct {
-	log    *slog.Logger
-	ufn    unknownFn
-	server *server.Server
+	log *slog.Logger
+	ufn unknownFn
+	srv atomic.Pointer[server.Server]
 
 	mu  sync.RWMutex
 	tbl table
@@ -54,14 +55,12 @@ func New(opts ...Option) *Router {
 	return r
 }
 
-// Bind 创建路由表并接管 Server 的根回调。
-func Bind(server *server.Server, opts ...Option) *Router {
-	if server == nil {
+// Attach 关联 Server，用于 Start/Serve/Connect 后冻结 Handle/MustHandle。
+func (r *Router) Attach(s *server.Server) *Router {
+	if s == nil {
 		panic("router: nil server")
 	}
-	r := New(opts...)
-	r.server = server
-	server.SetRootHandler(r.Handler())
+	r.srv.Store(s)
 	return r
 }
 
@@ -96,7 +95,7 @@ func (r *Router) Handle(id uint32, h server.HandlerFunc) {
 	if h == nil {
 		panic("router: nil handler")
 	}
-	if r.server != nil && r.server.Started() {
+	if s := r.srv.Load(); s != nil && s.Started() {
 		panic("router: handle after server started")
 	}
 	r.mu.Lock()
@@ -112,7 +111,7 @@ func (r *Router) MustHandle(id uint32, h server.HandlerFunc) {
 	if h == nil {
 		panic("router: nil handler")
 	}
-	if r.server != nil && r.server.Started() {
+	if s := r.srv.Load(); s != nil && s.Started() {
 		panic("router: handle after server started")
 	}
 	r.mu.Lock()

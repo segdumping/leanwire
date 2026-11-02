@@ -2,6 +2,11 @@ package codec
 
 import (
 	"bytes"
+	"go/parser"
+	"go/token"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -101,5 +106,50 @@ func TestReservedIDRegistry(t *testing.T) {
 			t.Fatalf("%s 与 %s 撞号 %#x", name, other, id)
 		}
 		seen[id] = name
+	}
+}
+
+// TestKernelPurity 机检内核纯净性：codec 是零依赖内核，不得 import 本仓库
+// 任何包（含 ext/ 插件），保证"插件可删除"的结构承诺有自动化验证。
+func TestKernelPurity(t *testing.T) {
+	entries, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	for _, path := range entries {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		for _, im := range f.Imports {
+			p := strings.Trim(im.Path.Value, `"`)
+			if strings.Contains(p, "segdumping/leanwire") {
+				t.Errorf("%s imports %s: kernel codec must stay dependency-free", path, p)
+			}
+		}
+	}
+}
+
+// TestKernelNoExtDeps 机检内核依赖闭包：codec 与 server 不得传递依赖 ext 包
+// （删得掉纪律：内核对插件零依赖，插件由 app 组合）。
+func TestKernelNoExtDeps(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go toolchain unavailable")
+	}
+	out, err := exec.Command("go", "list", "-deps",
+		"github.com/segdumping/leanwire/codec", "github.com/segdumping/leanwire/server").CombinedOutput()
+	if err != nil {
+		t.Skipf("go list unavailable: %v (%s)", err, out)
+	}
+	const extPrefix = "github.com/segdumping/leanwire/ext"
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, extPrefix) {
+			t.Fatalf("内核依赖了 ext 包（破坏删得掉纪律）: %s", line)
+		}
 	}
 }

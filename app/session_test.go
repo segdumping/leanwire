@@ -22,10 +22,10 @@ func connectSessionTest(t *testing.T, a *App) (*server.Conn, net.Conn) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	runApp(a) // 入站派发有 ready 门控，需在 Run 下验证
 	t.Cleanup(func() {
-		_ = a.Server().Shutdown(ctx)
-		cancel()
+		a.Exit()
+		waitDone(t, a)
 		_ = testEnd.Close()
 	})
 	return c, testEnd
@@ -36,7 +36,7 @@ func TestHandleSession(t *testing.T) {
 	idCh := make(chan SessionID, 1)
 	a.Handle(1100, func(s Session, body []byte) {
 		idCh <- s.ID()
-		_ = s.SendBytes(1101, body)
+		_ = s.SendBytes(nil, 1101, body)
 	})
 	c, testEnd := connectSessionTest(t, a)
 
@@ -97,10 +97,10 @@ func TestNewSession(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := s.SendWaitBytes(ctx, 1106, []byte("first")); err != nil {
+	if err := s.SendBytes(ctx, 1106, []byte("first")); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SendWaitBytes(ctx, 1107, []byte("raw")); err != nil {
+	if err := s.SendBytes(ctx, 1107, []byte("raw")); err != nil {
 		t.Fatal(err)
 	}
 

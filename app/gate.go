@@ -32,8 +32,7 @@ type Gate struct {
 type GateOption func(*gateConfig)
 
 type gateConfig struct {
-	log          *slog.Logger
-	clientRouter *router.Router
+	log *slog.Logger
 }
 
 // WithGateLogger 默认取 App 的日志器（a 为 nil 时用slog.Default()）。
@@ -45,18 +44,12 @@ func WithGateLogger(l *slog.Logger) GateOption {
 	}
 }
 
-// WithGateRouter 复用外部已创建的客户端路由表；未设置时 NewGate 自建一个。
-func WithGateRouter(clientRouter *router.Router) GateOption {
-	return func(c *gateConfig) {
-		if clientRouter != nil {
-			c.clientRouter = clientRouter
-		}
-	}
-}
-
-func NewGate(a *App, client *server.Server, opts ...GateOption) *Gate {
+func NewGate(a *App, client *server.Server, clientRouter *router.Router, opts ...GateOption) *Gate {
 	if client == nil {
 		panic("app: nil gate server")
+	}
+	if clientRouter == nil {
+		panic("app: nil gate router")
 	}
 	if client.Started() {
 		panic("app: NewGate called after client Serve/Connect")
@@ -68,18 +61,19 @@ func NewGate(a *App, client *server.Server, opts ...GateOption) *Gate {
 	for _, o := range opts {
 		o(&conf)
 	}
-	if conf.clientRouter == nil {
-		conf.clientRouter = router.New(router.WithLogger(conf.log))
-	}
-	client.SetRootHandler(conf.clientRouter.Handler())
 
 	g := &Gate{
 		app:          a,
 		clientServer: client,
-		clientRouter: conf.clientRouter,
+		clientRouter: clientRouter,
 		byUID:        make(map[uint64]Session),
 		byConnection: make(map[uint64]uint64),
 		log:          conf.log,
+	}
+	if a != nil {
+		a.mu.Lock()
+		a.clientServers = append(a.clientServers, client)
+		a.mu.Unlock()
 	}
 	client.AppendHooks(server.Hooks{OnClose: g.doUnbind})
 	return g
@@ -91,7 +85,8 @@ func (g *Gate) Server() *server.Server { return g.clientServer }
 
 func (g *Gate) Router() *router.Router { return g.clientRouter }
 
-// Bind 把 uid 绑定到连接上的 Session；同uid旧连接被顶
+// Bind 把 uid 绑定到连接上的 Session；同 uid 旧连接被顶。
+// 目标连接已关闭时返回 ErrClosed：排队中的迟到 handler 不再索引死连接。
 func (g *Gate) Bind(s Session, uid uint64) error {
 	if uid == 0 {
 		return ErrInvalidUID
@@ -102,8 +97,14 @@ func (g *Gate) Bind(s Session, uid uint64) error {
 	c := s.Conn()
 	bound := NewSession(c, uid)
 
-	var victim Session
 	g.mu.Lock()
+	select {
+	case <-c.Done(): // 连接已收尾：拒绝绑定（OnClose 与排队 handler 的竞态）
+		g.mu.Unlock()
+		return server.ErrClosed
+	default:
+	}
+	var victim Session
 	if prev, ok := g.byConnection[c.ID()]; ok && prev != uid {
 		if cur, ok2 := g.byUID[prev]; ok2 && cur.Conn() == c {
 			delete(g.byUID, prev)
@@ -153,59 +154,7 @@ func (g *Gate) SendTo(ctx context.Context, uid uint64, msgID uint32, payload []b
 	if !ok {
 		return ErrNoConnection
 	}
-	return s.SendWaitBytes(ctx, msgID, payload)
-}
-
-const broadcastWorkers = 32
-
-// Broadcast 向全部连接并行广播（至多 broadcastWorkers 路），返回成功投递条数
-func (g *Gate) Broadcast(ctx context.Context, msgID uint32, payload []byte) (int, error) {
-	var sessions []Session
-	g.clientServer.Range(func(c *server.Conn) bool {
-		g.mu.RLock()
-		uid, ok := g.byConnection[c.ID()]
-		var s Session
-		if ok {
-			if cur, exists := g.byUID[uid]; exists && cur.Conn() == c {
-				s = cur
-			}
-		}
-		g.mu.RUnlock()
-		if s == nil {
-			s = NewSession(c, c.ID())
-		}
-		sessions = append(sessions, s)
-		return true
-	})
-
-	var (
-		wg   sync.WaitGroup
-		mu   sync.Mutex
-		n    int
-		errs []error
-	)
-	sem := make(chan struct{}, broadcastWorkers)
-	for _, s := range sessions {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(s Session) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			switch err := s.SendWaitBytes(ctx, msgID, payload); {
-			case err == nil:
-				mu.Lock()
-				n++
-				mu.Unlock()
-			case errors.Is(err, server.ErrClosed):
-			default:
-				mu.Lock()
-				errs = append(errs, err)
-				mu.Unlock()
-			}
-		}(s)
-	}
-	wg.Wait()
-	return n, errors.Join(errs...)
+	return s.SendBytes(ctx, msgID, payload)
 }
 
 func (g *Gate) sessionOf(c *server.Conn, conf sessionConfig) Session {
@@ -232,7 +181,7 @@ func (g *Gate) HandleClient(msgID uint32, h func(s Session, body []byte), opts .
 	conf := sessionOptions(opts)
 	g.clientRouter.Handle(msgID, func(c *server.Conn, m codec.Msg) {
 		s, body := g.sessionOf(c, conf), m.Body
-		g.post(uint64(s.ID()), func() { h(s, body) })
+		g.post(c.ID(), func() { h(s, body) })
 	})
 }
 
@@ -252,7 +201,9 @@ func (g *Gate) HandleServer(msgID uint32, h func(s Session, body []byte), opts .
 	g.app.Handle(msgID, h, opts...)
 }
 
-func (g *Gate) Handle(msgID uint32, forward func(s Session, uid uint64, payload []byte)) {
+// Handle 注册网关转发：仅服务已 Bind 的连接（未绑定的直接丢弃——转发目标
+// 按用户组织，没有 uid 就没有目的地）。回调里 s.ID() 即 Bind 的 uid。
+func (g *Gate) Handle(msgID uint32, forward func(s Session, payload []byte)) {
 	if g.clientRouter == nil {
 		panic("app: gate forward router required")
 	}
@@ -267,7 +218,7 @@ func (g *Gate) Handle(msgID uint32, forward func(s Session, uid uint64, payload 
 			return
 		}
 		s, body := NewSession(c, uid), m.Body
-		g.post(uid, func() { forward(s, uid, body) })
+		g.post(c.ID(), func() { forward(s, body) })
 	})
 }
 

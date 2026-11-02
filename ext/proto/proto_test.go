@@ -29,16 +29,17 @@ func marshal(m gproto.Message) []byte {
 
 // Unmarshal 进 handler、Marshal 出 Send；坏体丢弃不断开连接。
 func TestRegisterAndSend(t *testing.T) {
-	a := server.New(server.WithLogger(quietLogger()))
+	routeTable := router.New()
+	a := server.New(server.WithLogger(quietLogger()), server.WithRootHandler(routeTable.Handler()))
+	routeTable.Attach(a)
 	defer func() { _ = a.Shutdown(nil) }()
 
 	got := make(chan *wrapperspb.StringValue, 4)
-	routeTable := router.Bind(a)
 	Register(routeTable, 50, func(s *server.Conn, m *wrapperspb.StringValue) {
 		got <- m
 	})
 	Register(routeTable, 51, func(s *server.Conn, m *wrapperspb.StringValue) {
-		_ = Send(s, 52, wrapperspb.String("reply:"+m.Value))
+		_ = Send(s, nil, 52, wrapperspb.String("reply:"+m.Value))
 	})
 
 	serverEnd, testEnd := net.Pipe()

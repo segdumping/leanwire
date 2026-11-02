@@ -70,11 +70,12 @@ func TestBucketRefillAndDrop(t *testing.T) {
 
 func TestWrapPerSessionDrop(t *testing.T) {
 	log := &capLog{}
+	routeTable := router.New()
 	testServer := server.New(server.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
-		server.WithFlushTimeout(150*time.Millisecond))
+		server.WithFlushTimeout(150*time.Millisecond), server.WithRootHandler(routeTable.Handler()))
+	routeTable.Attach(testServer)
 	l := New(testServer, WithQPS(1), WithBurst(1), WithLogger(slog.New(log)))
 	var got atomic.Int64
-	routeTable := router.Bind(testServer)
 	routeTable.Handle(1, l.Wrap(func(*server.Conn, codec.Msg) { got.Add(1) }))
 
 	serverEnd, testEnd := net.Pipe()
@@ -101,11 +102,12 @@ func TestWrapPerSessionDrop(t *testing.T) {
 
 func TestGlobalBucketShared(t *testing.T) {
 	log := &capLog{}
+	routeTable := router.New()
 	testServer := server.New(server.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
-		server.WithFlushTimeout(150*time.Millisecond))
+		server.WithFlushTimeout(150*time.Millisecond), server.WithRootHandler(routeTable.Handler()))
+	routeTable.Attach(testServer)
 	l := New(testServer, WithQPS(0) /*禁连接级*/, WithGlobalQPS(1), WithLogger(slog.New(log)))
 	var got atomic.Int64
-	routeTable := router.Bind(testServer)
 	routeTable.Handle(1, l.Wrap(func(*server.Conn, codec.Msg) { got.Add(1) }))
 
 	c := codec.DefaultCodec(64 * 1024)
@@ -131,10 +133,11 @@ func TestGlobalBucketShared(t *testing.T) {
 }
 
 func TestOnCloseEvictsBucket(t *testing.T) {
+	routeTable := router.New()
 	testServer := server.New(server.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
-		server.WithFlushTimeout(150*time.Millisecond))
+		server.WithFlushTimeout(150*time.Millisecond), server.WithRootHandler(routeTable.Handler()))
+	routeTable.Attach(testServer)
 	l := New(testServer, WithQPS(100))
-	routeTable := router.Bind(testServer)
 	routeTable.Handle(1, l.Wrap(func(*server.Conn, codec.Msg) {}))
 
 	serverEnd, testEnd := net.Pipe()

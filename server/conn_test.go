@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"errors"
-	"log/slog"
 	"net"
 	"strings"
 	"sync"
@@ -17,10 +16,9 @@ import (
 // 5.2 同连接顺序
 func TestOrdering(t *testing.T) {
 	const n = 100
-	server := New(WithQueueSize(4096), WithLogger(quietLogger()))
-	tt := newTestTable(server)
+	server, tt := newTestServer(WithQueueSize(4096), WithLogger(quietLogger()))
 	tt.Handle(1, func(s *Conn, m codec.Msg) {
-		_ = s.Send(m) // echo
+		_ = s.Send(nil, m) // echo
 	})
 	serverEnd, testEnd := pipePair()
 	s := attachConn(t, server, serverEnd)
@@ -31,7 +29,7 @@ func TestOrdering(t *testing.T) {
 
 	for i := 0; i < n; i++ {
 		body := []byte{byte(i >> 24), byte(i >> 16), byte(i >> 8), byte(i)}
-		if err := s.Send(codec.Msg{ID: 1, Body: body}); err != nil {
+		if err := s.Send(nil, codec.Msg{ID: 1, Body: body}); err != nil {
 			t.Fatalf("send #%d: %v", i, err)
 		}
 	}
@@ -128,7 +126,7 @@ func TestCloseFlushesExactlyOnce(t *testing.T) {
 
 	const n = 10
 	for i := 0; i < n; i++ {
-		if err := s.Send(codec.Msg{ID: 1, Body: []byte("m")}); err != nil {
+		if err := s.Send(nil, codec.Msg{ID: 1, Body: []byte("m")}); err != nil {
 			t.Fatalf("send: %v", err)
 		}
 	}
@@ -164,7 +162,7 @@ drain:
 			t.Fatalf("flush timeout at %d/%d", got, n)
 		}
 	}
-	if err := s.Send(codec.Msg{ID: 1}); err != ErrClosed {
+	if err := s.Send(nil, codec.Msg{ID: 1}); err != ErrClosed {
 		t.Fatalf("send after close: want ErrClosed, got %v", err)
 	}
 	select {
@@ -204,12 +202,11 @@ func TestIdleTimeout(t *testing.T) {
 // 5.7 handler panic：OnError 收到错误，连接保持
 func TestPanicRecovered(t *testing.T) {
 	errCh := make(chan error, 1)
-	server := New(WithIdleTimeout(time.Minute), WithHooks(Hooks{
+	server, tt := newTestServer(WithIdleTimeout(time.Minute), WithHooks(Hooks{
 		OnError: func(s *Conn, err error) { errCh <- err },
 	}), WithLogger(quietLogger()))
-	tt := newTestTable(server)
 	tt.Handle(1, func(s *Conn, m codec.Msg) { panic("boom") })
-	tt.Handle(2, func(s *Conn, m codec.Msg) { _ = s.Send(codec.Msg{ID: 2, Body: []byte("ok")}) })
+	tt.Handle(2, func(s *Conn, m codec.Msg) { _ = s.Send(nil, codec.Msg{ID: 2, Body: []byte("ok")}) })
 
 	serverEnd, testEnd := pipePair()
 	_ = attachConn(t, server, serverEnd)
@@ -283,7 +280,7 @@ func TestSendCloseRace(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < per; i++ {
-				if err := s.Send(codec.Msg{ID: 1, Body: []byte("r")}); err == nil {
+				if err := s.Send(nil, codec.Msg{ID: 1, Body: []byte("r")}); err == nil {
 					nilSends.Add(1)
 				}
 			}
@@ -333,7 +330,7 @@ func TestHalfOpenWriterDeadline(t *testing.T) {
 	_ = testEnd // 对端停止读取
 
 	for i := 0; i < 8; i++ {
-		if err := s.Send(codec.Msg{ID: 1, Body: []byte("half")}); err != nil {
+		if err := s.Send(nil, codec.Msg{ID: 1, Body: []byte("half")}); err != nil {
 			break
 		}
 	}
@@ -346,7 +343,7 @@ func TestHalfOpenWriterDeadline(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("half-open close did not happen within timeout")
 	}
-	if err := s.Send(codec.Msg{ID: 1}); err != ErrClosed {
+	if err := s.Send(nil, codec.Msg{ID: 1}); err != ErrClosed {
 		t.Fatalf("send after half-open close: want ErrClosed, got %v", err)
 	}
 	waitSessionGoroutines(t, server) // 检查无协程泄漏
@@ -363,66 +360,6 @@ func waitSessionGoroutines(t *testing.T, server *Server) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Conn goroutines leaked")
-	}
-}
-
-// Debug 消息流水：msg in/out
-type msgLogCapture struct {
-	mu   sync.Mutex
-	recs []slog.Record
-}
-
-func (h *msgLogCapture) Enabled(context.Context, slog.Level) bool { return true }
-
-func (h *msgLogCapture) Handle(_ context.Context, r slog.Record) error {
-	h.mu.Lock()
-	h.recs = append(h.recs, r.Clone())
-	h.mu.Unlock()
-	return nil
-}
-
-func (h *msgLogCapture) WithAttrs([]slog.Attr) slog.Handler { return h }
-func (h *msgLogCapture) WithGroup(string) slog.Handler      { return h }
-
-// 内核在 Debug 级发消息流水（msg in/out）；ext 可用 slog.Handler 截取。
-func TestMsgFlowDebugLogged(t *testing.T) {
-	cap := &msgLogCapture{}
-	server := New(WithLogger(slog.New(cap)))
-	tt := newTestTable(server)
-	tt.Handle(1, func(s *Conn, m codec.Msg) { _ = s.Send(m) })
-
-	serverEnd, testEnd := pipePair()
-	_ = attachConn(t, server, serverEnd)
-	c := newCodec()
-	writeMsg(t, testEnd, c, codec.Msg{ID: 1, Body: []byte("hi")})
-	_ = testEnd.SetReadDeadline(time.Now().Add(2 * time.Second))
-	if _, err := c.ReadMsg(testEnd); err != nil {
-		t.Fatal(err)
-	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		cap.mu.Lock()
-		in, out := false, false
-		for _, r := range cap.recs {
-			if r.Level != slog.LevelDebug {
-				continue
-			}
-			switch r.Message {
-			case "msg in":
-				in = true
-			case "msg out":
-				out = true
-			}
-		}
-		cap.mu.Unlock()
-		if in && out {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("msg in/out Debug logs missing")
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -466,8 +403,8 @@ func TestTrySend(t *testing.T) {
 	waitSessionGoroutines(t, server)
 }
 
-// SendWait 限时：ctx 到期返回 ctx 错误，不占用阻塞预算。
-func TestSendWaitDeadline(t *testing.T) {
+// Send 限时：ctx 到期返回 ctx 错误，不占用阻塞预算。
+func TestSendDeadline(t *testing.T) {
 	// 写超时 500ms：给 writer 留出阻塞窗口，避免排空预算先行关闭连接
 	server := New(WithQueueSize(1), WithFlushTimeout(500*time.Millisecond), WithLogger(quietLogger()))
 	serverEnd, _ := pipePair() // 对端不读：同步写阻塞
@@ -495,21 +432,21 @@ func TestSendWaitDeadline(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	err := s.SendWait(ctx, codec.Msg{ID: 1, Body: []byte("y")})
+	err := s.Send(ctx, codec.Msg{ID: 1, Body: []byte("y")})
 	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("SendWait = %v, want context.DeadlineExceeded", err)
+		t.Fatalf("Send = %v, want context.DeadlineExceeded", err)
 	}
 	waitSessionGoroutines(t, server)
 }
 
-// SendWait(nil) 等价于 Send：空余队列立即入队。
-func TestSendWaitNilCtx(t *testing.T) {
+// Send(nil) 使用 flush 兜底超时：空余队列立即入队。
+func TestSendNilCtx(t *testing.T) {
 	server := New(WithQueueSize(256), shortFlush(), WithLogger(quietLogger()))
 	serverEnd, _ := pipePair()
 	s := attachConn(t, server, serverEnd)
 	defer s.Close()
-	if err := s.SendWait(nil, codec.Msg{ID: 1, Body: []byte("z")}); err != nil {
-		t.Fatalf("SendWait(nil) = %v", err)
+	if err := s.Send(nil, codec.Msg{ID: 1, Body: []byte("z")}); err != nil {
+		t.Fatalf("Send(nil) = %v", err)
 	}
 	waitSessionGoroutines(t, server)
 }

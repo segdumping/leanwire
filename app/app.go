@@ -14,11 +14,13 @@
 //
 // 生命周期（Run）：
 //  1. 启动各 Depend 的出站连接（拨号循环开始）；
-//  2. 执行 OnStart 钩子（在任何入站消息之前）；
-//  3. 起听、向目录注册自身；
+//  2. 执行 AppendStarting 钩子；入站派发由 ready 门控，任何 handler 都在 AppendStarting
+//     完成之后才执行（提早在读侧阻塞等待，天然背压不缓冲）；
+//  3. 起听、向目录注册自身（失败转入后台退避重试，不阻塞 Run）；
 //  4. 阻塞至 SIGINT/SIGTERM 或 Exit()；
-//  5. 停止：摘除目录 → OnStop（连接仍开放，可收尾 Send）→ 停出站连接 →
-//     内核 Shutdown（关连接、限时排空、等待读写协程）→ OnFini（倒序）。
+//  5. 停止：摘除目录 → AppendStopping（连接仍开放，可收尾 Send；钩子限时执行）→
+//     停出站连接 → 内核 Shutdown（关连接、限时排空、等待读写协程；Gate
+//     持有的 client Server 随内部 Server 同预算并发关闭）→ AppendStopped（倒序）。
 //
 // 退出期（IsExit 为真后）拒收新的单向消息与请求，只继续处理响应。
 //
@@ -27,9 +29,9 @@
 // 可选 ext/lb.Picker 只在重拨时选 endpoint，不做调用级轮转。按业务键的路由
 // （例如 uid 落到固定节点）属业务层：为每个 division/节点单独声明 Depend。
 //
-// Run 之后仍可调用 Depend / Registry；Handle、Serve、OnStart/OnStop/OnFini
-// 必须在 Run 前调用，之后 panic。RPC handler 通过 RPC().Handle 注册，同样
-// 须在首个 Serve/Connect 前完成。
+// Run 之后仍可调用 Depend / Registry；Handle、Serve、AppendStarting/AppendStopping/AppendStopped
+// 必须在 Run 前调用，之后 panic。RPC handler 通过 RPC().Handle 注册，
+// 支持运行期更新（注册有锁，同号后注册覆盖前者并记 Warn）。
 package app
 
 import (
@@ -56,11 +58,11 @@ import (
 )
 
 const (
-	// defaultStopTimeout 是停止总预算（OnStop 与内核 Shutdown 共享）。
-	defaultStopTimeout = 10 * time.Second
-	// defaultHeartbeatInterval 是 WithHeartbeat 未给间隔时的发送周期。
+	defaultStopTimeout       = 10 * time.Second
 	defaultHeartbeatInterval = 10 * time.Second
 	defaultWorkers           = 1
+	registerRetryBase        = 500 * time.Millisecond
+	registerRetryMax         = 5 * time.Second
 )
 
 var (
@@ -80,153 +82,181 @@ func reservedID(id uint32) bool {
 	return codec.IsReserved(id)
 }
 
+type appOptions struct {
+	name        string
+	log         *slog.Logger
+	codec       codec.Codec
+	idle        time.Duration
+	idleSet     bool
+	heartbeat   time.Duration
+	workers     int
+	queueSize   int
+	stopTimeout time.Duration
+	reg         registry.Registry
+	serviceName string
+	advertise   string
+}
+
 // Option 配置 App。
-type Option func(*App)
+type Option func(*appOptions)
 
 // WithLogger 默认 slog.Default()。
 func WithLogger(l *slog.Logger) Option {
-	return func(a *App) {
+	return func(o *appOptions) {
 		if l != nil {
-			a.log = l.With("app", a.name)
+			o.log = l.With("app", o.name)
 		}
 	}
 }
 
 // WithIdleTimeout 显式配置连接空闲超时；未配置时用内核默认（10 分钟）
 func WithIdleTimeout(d time.Duration) Option {
-	return func(a *App) {
-		a.idle = d
-		a.idleSet = true
+	return func(o *appOptions) {
+		o.idle = d
+		o.idleSet = true
 	}
 }
 
 // WithRegistry 设置目录：Run 时以目录名（WithServiceName，缺省 App 名）
-func WithRegistry(r registry.Registry) Option { return func(a *App) { a.reg = r } }
+func WithRegistry(r registry.Registry) Option {
+	return func(o *appOptions) {
+		o.reg = r
+	}
+}
 
 // WithServiceName 覆盖目录注册名（默认取 App 名）
 func WithServiceName(name string) Option {
-	return func(a *App) {
+	return func(o *appOptions) {
 		if name != "" {
-			a.serviceName = name
+			o.serviceName = name
 		}
 	}
 }
 
-func WithCodec(c codec.Codec) Option { return func(a *App) { a.codec = c } }
+func WithCodec(c codec.Codec) Option {
+	return func(o *appOptions) {
+		o.codec = c
+	}
+}
 
 // WithAdvertise 覆盖注册用的对外地址；缺省用首个 listener 的实际地址。
-func WithAdvertise(addr string) Option { return func(a *App) { a.advertise = addr } }
+func WithAdvertise(addr string) Option {
+	return func(o *appOptions) {
+		o.advertise = addr
+	}
+}
 
 // WithHeartbeat 启用连接保活与失效连接检测
 func WithHeartbeat(d time.Duration) Option {
-	return func(a *App) {
+	return func(o *appOptions) {
 		if d <= 0 {
 			d = defaultHeartbeatInterval
 		}
-		a.heartbeat = d
+		o.heartbeat = d
 	}
 }
 
-// WithStopTimeout 默认 10s。
+// WithStopTimeout 设置停止总预算：worker 排空、AppendStopping/AppendStopped 限时执行与
+// 内核 Shutdown 共享同一预算，默认 10s。
 func WithStopTimeout(d time.Duration) Option {
-	return func(a *App) {
+	return func(o *appOptions) {
 		if d > 0 {
-			a.stopTimeout = d
+			o.stopTimeout = d
 		}
 	}
 }
 
-// WithWorkers 设置 worker 数量，默认 1；回调按 key 固定落到同一 worker。
+// WithWorkers 设置 worker 数量，默认 1；入站回调靠连接 ID 固定落到同一
+// worker（Bind 改写 Session ID 也不会破坏单连接保序）。
 func WithWorkers(n int) Option {
-	return func(a *App) {
+	return func(o *appOptions) {
 		if n > 0 {
-			a.workers = n
+			o.workers = n
 		}
 	}
 }
 
 // WithQueueSize 设置每条连接的发送队列容量，默认 1024。
 func WithQueueSize(n int) Option {
-	return func(a *App) {
+	return func(o *appOptions) {
 		if n > 0 {
-			a.queueSize = n
+			o.queueSize = n
 		}
 	}
 }
 
 type App struct {
+	appOptions
 	name string
 	log  *slog.Logger
 
-	appServer *server.Server
-	codec     codec.Codec
-
-	idle      time.Duration
-	idleSet   bool
-	heartbeat time.Duration
-	hb        *heartbeat.Heartbeat
-
+	// 内核与运行期组件
+	appServer     *server.Server
 	rpcChannel    *rpc.Channel
 	messageRouter *router.Router
 	worker        *shard.Pool
-	workers       int
-	queueSize     int
+	hb            *heartbeat.Heartbeat
 
-	reg         registry.Registry
-	serviceName string // 目录注册名（空 = 用 App 名）
-	advertise   string
-	dereg       func() // 注册句柄；stop 时摘除
-
-	stopTimeout time.Duration
-
-	ctx    context.Context
-	cancel context.CancelFunc
-
+	// 生命周期状态机
+	ctx           context.Context
+	cancel        context.CancelFunc
 	started       atomic.Bool
 	workerClosing atomic.Bool
+	stopping      bool
 	exitCh        chan struct{}
 	exitOnce      sync.Once
+	readyCh       chan struct{}
 	done          chan struct{}
 	stopOnce      sync.Once
 	runErr        error
 
 	mu        sync.Mutex
-	listeners []net.Listener
-	clients   map[string]*Client
-	onStarts  []func(*App)
-	onStops   []func(*App)
-	onFinis   []func(*App)
+	lifecycle struct {
+		start    []func(*App)
+		stopping []func(*App)
+		stopped  []func(*App)
+	}
+	listeners     []net.Listener
+	clients       map[string]*Client
+	clientServers []*server.Server
+	dereg         func()
 }
 
 func New(name string, opts ...Option) *App {
-	a := &App{
+	o := &appOptions{
 		name:        name,
 		log:         slog.Default().With("app", name),
 		stopTimeout: defaultStopTimeout,
-		exitCh:      make(chan struct{}),
-		done:        make(chan struct{}),
-		clients:     make(map[string]*Client),
 		workers:     defaultWorkers,
 	}
-	for _, o := range opts {
-		o(a)
+	for _, opt := range opts {
+		opt(o)
+	}
+	a := &App{
+		name:       name,
+		appOptions: *o,
+		log:        o.log,
+		exitCh:     make(chan struct{}),
+		readyCh:    make(chan struct{}),
+		done:       make(chan struct{}),
+		clients:    make(map[string]*Client),
 	}
 	a.ctx, a.cancel = context.WithCancel(context.Background())
-	a.worker = shard.New(a.workers, shard.WithLogger(a.log))
+	a.worker = shard.New(o.workers, shard.WithLogger(a.log))
 
 	serverOptions := []server.Option{server.WithLogger(a.log)}
-	if a.codec != nil {
-		serverOptions = append(serverOptions, server.WithCodec(a.codec))
+	if o.codec != nil {
+		serverOptions = append(serverOptions, server.WithCodec(o.codec))
 	}
-	if a.queueSize > 0 {
-		serverOptions = append(serverOptions, server.WithQueueSize(a.queueSize))
+	if o.queueSize > 0 {
+		serverOptions = append(serverOptions, server.WithQueueSize(o.queueSize))
 	}
 
 	switch {
-	case a.heartbeat > 0 && !a.idleSet:
-		serverOptions = append(serverOptions, server.WithIdleTimeout(3*a.heartbeat))
-	case a.idleSet:
-		serverOptions = append(serverOptions, server.WithIdleTimeout(a.idle))
+	case o.heartbeat > 0 && !o.idleSet:
+		serverOptions = append(serverOptions, server.WithIdleTimeout(3*o.heartbeat))
+	case o.idleSet:
+		serverOptions = append(serverOptions, server.WithIdleTimeout(o.idle))
 	}
 
 	a.messageRouter = router.New(router.WithLogger(a.log))
@@ -239,8 +269,8 @@ func New(name string, opts ...Option) *App {
 	)
 	serverOptions = append(serverOptions, server.WithRootHandler(a.messageRouter.Handler()))
 	a.appServer = server.New(serverOptions...)
-	if a.heartbeat > 0 {
-		a.hb = heartbeat.New(a.appServer, a.heartbeat)
+	if o.heartbeat > 0 {
+		a.hb = heartbeat.New(a.appServer, o.heartbeat)
 	}
 	return a
 }
@@ -266,23 +296,32 @@ func (a *App) post(key uint64, fn func()) bool {
 	if fn == nil || a.worker == nil || a.workerClosing.Load() {
 		return false
 	}
+	select {
+	case <-a.readyCh:
+	case <-a.ctx.Done():
+		return false
+	}
 	return a.worker.Post(key, fn)
 }
 
-// Post 把任务投递到 App 的 worker 队列；返回 false 表示 App 已停止。
 func (a *App) Post(fn func()) bool {
 	return a.post(0, fn)
 }
 
-// TryPost 非阻塞投递；队列满或 App 已停止返回 false。
 func (a *App) TryPost(fn func()) bool {
 	if fn == nil || a.worker == nil || a.workerClosing.Load() {
+		return false
+	}
+	select {
+	case <-a.readyCh:
+	case <-a.ctx.Done():
+		return false
+	default:
 		return false
 	}
 	return a.worker.TryPost(0, fn)
 }
 
-// AfterPost 延时投递；返回的 cancel 可取消尚未执行的任务。
 func (a *App) AfterPost(d time.Duration, fn func()) (cancel func() bool) {
 	if fn == nil {
 		return func() bool { return false }
@@ -314,7 +353,7 @@ func (a *App) Handle(id uint32, h func(s Session, body []byte), opts ...SessionO
 	conf := sessionOptions(opts)
 	a.messageRouter.Handle(id, func(c *server.Conn, m codec.Msg) {
 		s, body := conf.wrap(c), m.Body
-		a.post(uint64(s.ID()), func() {
+		a.post(c.ID(), func() {
 			if a.IsExit() {
 				return
 			}
@@ -331,37 +370,38 @@ func (a *App) MustHandle(id uint32, h func(s Session, body []byte), opts ...Sess
 	a.Handle(id, h, opts...)
 }
 
-func (a *App) OnStart(f func(*App)) {
-	a.beforeRun("OnStart")
+func (a *App) AppendStarting(f func(*App)) {
+	a.beforeRun("AppendStarting")
 	if f == nil {
 		panic("app: nil hook")
 	}
 	a.mu.Lock()
-	a.onStarts = append(a.onStarts, f)
+	a.lifecycle.start = append(a.lifecycle.start, f)
 	a.mu.Unlock()
 }
 
-func (a *App) OnStop(f func(*App)) {
-	a.beforeRun("OnStop")
+func (a *App) AppendStopping(f func(*App)) {
+	a.beforeRun("AppendStopping")
 	if f == nil {
 		panic("app: nil hook")
 	}
 	a.mu.Lock()
-	a.onStops = append(a.onStops, f)
+	a.lifecycle.stopping = append(a.lifecycle.stopping, f)
 	a.mu.Unlock()
 }
 
-func (a *App) OnFini(f func(*App)) {
-	a.beforeRun("OnFini")
+func (a *App) AppendStopped(f func(*App)) {
+	a.beforeRun("AppendStopped")
 	if f == nil {
 		panic("app: nil hook")
 	}
 	a.mu.Lock()
-	a.onFinis = append(a.onFinis, f)
+	a.lifecycle.stopped = append(a.lifecycle.stopped, f)
 	a.mu.Unlock()
 }
 
 func (a *App) Listen(addr string) error {
+	a.beforeRun("Serve")
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -374,13 +414,12 @@ func (a *App) Serve(listener net.Listener) {
 	if listener == nil {
 		panic("app: nil listener")
 	}
-	a.beforeRun("Serve")
 	a.mu.Lock()
+	a.beforeRun("Serve")
 	a.listeners = append(a.listeners, listener)
 	a.mu.Unlock()
 }
 
-// Depend 声明对某个 name（服务名或 division）的依赖
 func (a *App) Depend(name string, opts ...ClientOption) *Client {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -411,7 +450,7 @@ func (a *App) Run() error {
 	for _, client := range a.clients {
 		clients = append(clients, client)
 	}
-	starts := append([]func(*App){}, a.onStarts...)
+	starts := append([]func(*App){}, a.lifecycle.start...)
 	a.mu.Unlock()
 
 	for _, client := range clients {
@@ -420,6 +459,7 @@ func (a *App) Run() error {
 	for _, f := range starts {
 		f(a)
 	}
+	close(a.readyCh)
 	if err := a.appServer.Start(); err != nil {
 		a.log.Error("app: server run failed", "err", err)
 		a.Exit()
@@ -459,13 +499,16 @@ func (a *App) stop() {
 		a.Exit()
 
 		a.mu.Lock()
+		a.stopping = true
 		dereg := a.dereg
+		a.dereg = nil
 		clients := make([]*Client, 0, len(a.clients))
 		for _, client := range a.clients {
 			clients = append(clients, client)
 		}
-		stops := append([]func(*App){}, a.onStops...)
-		finis := append([]func(*App){}, a.onFinis...)
+		clientServers := append([]*server.Server(nil), a.clientServers...)
+		stops := append([]func(*App){}, a.lifecycle.stopping...)
+		finis := append([]func(*App){}, a.lifecycle.stopped...)
 		a.mu.Unlock()
 
 		if dereg != nil {
@@ -484,19 +527,44 @@ func (a *App) stop() {
 			_ = a.worker.Drain(ctx)
 		}
 		for _, f := range stops {
-			f(a)
+			a.runHook(ctx, "AppendStopping", f)
 		}
 		for _, client := range clients {
 			client.stop()
 		}
+
+		var shutdownWG sync.WaitGroup
+		for _, cs := range clientServers {
+			shutdownWG.Add(1)
+			go func() {
+				defer shutdownWG.Done()
+				if err := cs.Shutdown(ctx); err != nil {
+					a.log.Warn("app: client server shutdown", "err", err)
+				}
+			}()
+		}
 		serr := a.appServer.Shutdown(ctx)
+		shutdownWG.Wait()
 
 		for _, fini := range slices.Backward(finis) {
-			fini(a)
+			a.runHook(ctx, "AppendStopped", fini)
 		}
 		a.runErr = serr
 		close(a.done)
 	})
+}
+
+func (a *App) runHook(ctx context.Context, name string, f func(*App)) {
+	hookDone := make(chan struct{})
+	go func() {
+		defer close(hookDone)
+		f(a)
+	}()
+	select {
+	case <-hookDone:
+	case <-ctx.Done():
+		a.log.Warn("app: lifecycle hook exceeded stop budget", "hook", name)
+	}
 }
 
 func (a *App) registerSelf() {
@@ -512,92 +580,47 @@ func (a *App) registerSelf() {
 			a.log.Info("app: no internal listener, skip self-register")
 			return
 		}
-		addr = routableAddr(listeners[0].Addr())
+		tcp, ok := listeners[0].Addr().(*net.TCPAddr)
+		if !ok || tcp.IP == nil || tcp.IP.IsUnspecified() {
+			a.log.Info("app: advertise not set and listener addr is unspecified, skip self-register (set WithAdvertise)")
+			return
+		}
+		addr = listeners[0].Addr().String()
 	}
 	name := a.name
 	if a.serviceName != "" {
 		name = a.serviceName
 	}
-	d, err := a.reg.Register(a.ctx, name, registry.Endpoint{Addr: addr})
-	if err != nil {
+	go a.registerLoop(name, addr)
+}
+
+func (a *App) registerLoop(name, addr string) {
+	backoff := registerRetryBase
+	for {
+		d, err := a.reg.Register(a.ctx, name, registry.Endpoint{Addr: addr})
+		if err == nil {
+			a.mu.Lock()
+			if a.stopping { // 已停机：立即摘除，迟到的句柄不登记
+				a.mu.Unlock()
+				d()
+				return
+			}
+			a.dereg = d
+			a.mu.Unlock()
+			a.log.Info("app: self-registered", "name", name, "addr", addr)
+			return
+		}
+		if a.ctx.Err() != nil {
+			return
+		}
 		a.log.Warn("app: register failed", "addr", addr, "err", err)
-		return
+		select {
+		case <-a.ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		backoff = min(backoff*2, registerRetryMax)
 	}
-	a.mu.Lock()
-	a.dereg = d
-	a.mu.Unlock()
-}
-
-func routableAddr(addr net.Addr) string {
-	host, port := "", ""
-	if tcp, ok := addr.(*net.TCPAddr); ok {
-		if tcp.IP != nil && !tcp.IP.IsUnspecified() {
-			host = tcp.IP.String()
-		}
-		port = strconv.Itoa(tcp.Port)
-	} else {
-		h, p, err := net.SplitHostPort(addr.String())
-		if err != nil {
-			return addr.String()
-		}
-		host, port = h, p
-	}
-	if host == "" {
-		if port == "" {
-			return addr.String()
-		}
-		return net.JoinHostPort(localRoutableIP(), port)
-	}
-	if host == "localhost" {
-		return net.JoinHostPort(host, port)
-	}
-	if ip := net.ParseIP(host); ip != nil {
-		if ip.IsUnspecified() {
-			return net.JoinHostPort(localRoutableIP(), port)
-		}
-		return net.JoinHostPort(host, port)
-	}
-	return net.JoinHostPort(host, port)
-}
-
-func localRoutableIP() string {
-	if conn, err := net.Dial("udp", "8.8.8.8:53"); err == nil {
-		defer conn.Close()
-		if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok &&
-			addr.IP != nil && !addr.IP.IsUnspecified() && !addr.IP.IsLoopback() {
-			return addr.IP.String()
-		}
-	}
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return "127.0.0.1"
-	}
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagPointToPoint != 0 {
-			continue
-		}
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-		var fallback string
-		for _, a := range addrs {
-			ipnet, ok := a.(*net.IPNet)
-			if !ok || ipnet.IP.To4() == nil || ipnet.IP.IsLinkLocalUnicast() {
-				continue
-			}
-			if ipnet.IP.IsPrivate() {
-				return ipnet.IP.String()
-			}
-			if fallback == "" {
-				fallback = ipnet.IP.String()
-			}
-		}
-		if fallback != "" {
-			return fallback
-		}
-	}
-	return "127.0.0.1"
 }
 
 func (a *App) beforeRun(what string) {

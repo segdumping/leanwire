@@ -12,7 +12,7 @@ import (
 func TestClientDetachStaleConn(t *testing.T) {
 	a := New("x", WithLogger(quietLogger()))
 	defer func() { _ = a.Server().Shutdown(nil) }()
-	client := &Client{app: a, name: "u1", firstUpCh: make(chan struct{})}
+	client := &Client{app: a, name: "u1", upCh: make(chan struct{}), firstUpCh: make(chan struct{})}
 
 	s1, _ := net.Pipe()
 	sess1, err := a.Server().Connect(s1)

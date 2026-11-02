@@ -3,6 +3,7 @@ package lb
 import (
 	"context"
 	"errors"
+	"math"
 	"math/rand/v2"
 	"net"
 	"sync/atomic"
@@ -14,6 +15,8 @@ import (
 // ErrNoEndpoint 候选集为空。
 var ErrNoEndpoint = errors.New("lb: no endpoint")
 
+// DialFunc 出站拨号：ctx 取消中断拨号（重连 Stop 也能取消），timeout 仅约束
+// 握手；连接生命周期由返回的 net.Conn 与其 Close 管理。
 type DialFunc func(ctx context.Context, addr string, timeout time.Duration) (net.Conn, error)
 
 type Picker interface {
@@ -54,10 +57,13 @@ func (w *weighted) Pick(endpoints []registry.Endpoint) (registry.Endpoint, error
 	if len(endpoints) == 0 {
 		return registry.Endpoint{}, ErrNoEndpoint
 	}
-	total := 0
+	// int64 累加 + 单点权重按候选数钳位：极端权重相加不致溢出为负、选择退化
+	const weightClamp = int64(math.MaxInt32)
+	perCap := weightClamp / int64(len(endpoints))
+	total := int64(0)
 	for _, endpoint := range endpoints {
 		if endpoint.Weight > 0 {
-			total += endpoint.Weight
+			total += min(int64(endpoint.Weight), perCap)
 		} else {
 			total++
 		}
@@ -67,6 +73,8 @@ func (w *weighted) Pick(endpoints []registry.Endpoint) (registry.Endpoint, error
 		wt := endpoints[idx].Weight
 		if wt <= 0 {
 			wt = 1
+		} else if int64(wt) > perCap {
+			wt = int(perCap)
 		}
 		r -= wt
 		if r <= 0 {

@@ -29,6 +29,8 @@ type Client struct {
 
 	mu        sync.Mutex
 	conn      *server.Conn
+	upCh      chan struct{} // 连接可用信号：attach 关闭、detach 换新
+	upClosed  bool          // upCh 是否已关闭（detach 换代时判断）
 	firstUp   sync.Once
 	firstUpCh chan struct{} // WaitReady 的就绪信号（首次连上即关闭）
 }
@@ -59,12 +61,16 @@ func WithPicker(p lb.Picker) ClientOption {
 
 // WithDialFunc 覆盖出站拨号（默认 TCP）
 func WithDialFunc(f lb.DialFunc) ClientOption {
-	return func(config *clientConfig) { config.dial = f }
+	return func(config *clientConfig) {
+		config.dial = f
+	}
 }
 
 // WithBackoff 覆盖重连退避区间（默认 500ms–10s）。
 func WithBackoff(min, max time.Duration) ClientOption {
-	return func(config *clientConfig) { config.minDelay, config.maxDelay = min, max }
+	return func(config *clientConfig) {
+		config.minDelay, config.maxDelay = min, max
+	}
 }
 
 func newClient(application *App, name string, opts []ClientOption) *Client {
@@ -72,7 +78,12 @@ func newClient(application *App, name string, opts []ClientOption) *Client {
 	for _, o := range opts {
 		o(&config)
 	}
-	client := &Client{app: application, name: name, firstUpCh: make(chan struct{})}
+	client := &Client{
+		app:       application,
+		name:      name,
+		upCh:      make(chan struct{}),
+		firstUpCh: make(chan struct{}),
+	}
 
 	reg := application.reg
 	if len(config.addrs) > 0 {
@@ -89,7 +100,7 @@ func newClient(application *App, name string, opts []ClientOption) *Client {
 	}
 
 	resolver := registry.NewResolver(application.ctx, reg, name)
-	dial := func() (net.Conn, error) {
+	dial := func(ctx context.Context) (net.Conn, error) {
 		endpoints := resolver.Endpoints()
 		if len(endpoints) == 0 {
 			if err := resolver.Err(); err != nil {
@@ -105,13 +116,14 @@ func newClient(application *App, name string, opts []ClientOption) *Client {
 				return nil, err
 			}
 		}
-		return dialEndpoint(application, config.dial, endpoint.Addr)
+		// ctx 取消（含 client.stop 的 Stop）会中断挂死的拨号。
+		return dialEndpoint(ctx, application, config.dial, endpoint.Addr)
 	}
 	return newClientWithDial(application, name, dial, config)
 }
 
-func newClientWithDial(application *App, name string, dial func() (net.Conn, error), config clientConfig) *Client {
-	client := &Client{app: application, name: name, firstUpCh: make(chan struct{})}
+func newClientWithDial(application *App, name string, dial func(context.Context) (net.Conn, error), config clientConfig) *Client {
+	client := &Client{app: application, name: name, upCh: make(chan struct{}), firstUpCh: make(chan struct{})}
 	client.reconn = peer.New(application.appServer, dial,
 		peer.WithOnConnected(client.attach),
 		peer.WithOnDisconnected(client.detach),
@@ -161,6 +173,31 @@ func (client *Client) WaitReady(ctx context.Context) error {
 	}
 }
 
+// WaitConnected 阻塞至当前连接可用；断线后再次调用等待重连。
+// 与 WaitReady（仅"首次连接"语义）互补，用于断线就绪感知。
+func (client *Client) WaitConnected(ctx context.Context) error {
+	if client.broken != nil {
+		return client.broken
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		client.mu.Lock()
+		conn, up := client.conn, client.upCh
+		client.mu.Unlock()
+		if conn != nil {
+			return nil
+		}
+		select {
+		case <-up:
+			continue // 唤醒后复查：可能已断线换代
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
 func (client *Client) Send(ctx context.Context, id uint32, payload []byte) error {
 	if client.broken != nil {
 		return client.broken
@@ -175,7 +212,7 @@ func (client *Client) Send(ctx context.Context, id uint32, payload []byte) error
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return s.SendWait(ctx, codec.Msg{ID: id, Body: payload})
+	return s.Send(ctx, codec.Msg{ID: id, Body: payload})
 }
 
 // Call 同步请求：回包与请求共用业务消息号 id
@@ -220,6 +257,11 @@ func (client *Client) current() (*server.Conn, error) {
 func (client *Client) attach(s *server.Conn) {
 	client.mu.Lock()
 	client.conn = s
+	closed := client.upClosed
+	if !closed {
+		close(client.upCh) // 唤醒 WaitConnected 等待方
+		client.upClosed = true
+	}
 	client.mu.Unlock()
 	client.firstUp.Do(func() { close(client.firstUpCh) })
 }
@@ -228,12 +270,18 @@ func (client *Client) detach(s *server.Conn) {
 	client.mu.Lock()
 	if client.conn == s {
 		client.conn = nil
+		if client.upClosed {
+			// 换代：已关闭的信号不复用，等待方唤醒后复查连接状态。
+			client.upCh = make(chan struct{})
+			client.upClosed = false
+		}
 	}
 	client.mu.Unlock()
 }
 
-func dialEndpoint(a *App, f lb.DialFunc, addr string) (net.Conn, error) {
-	ctx, cancel := context.WithTimeout(a.ctx, defaultDialTimeout)
+func dialEndpoint(ctx context.Context, a *App, f lb.DialFunc, addr string) (net.Conn, error) {
+	// defaultDialTimeout 仅约束单次握手；ctx 来自重连循环（Stop 可取消）。
+	ctx, cancel := context.WithTimeout(ctx, defaultDialTimeout)
 	defer cancel()
 	if f != nil {
 		return f(ctx, addr, defaultDialTimeout)

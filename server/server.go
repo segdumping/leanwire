@@ -54,7 +54,7 @@ type config struct {
 
 type Option func(*config)
 
-// WithRootHandler 设置消息回调
+// WithRootHandler 设置消息回调；只能在 New 时设置一次。
 func WithRootHandler(fn HandlerFunc) Option {
 	return func(conf *config) {
 		if conf.rootSet {
@@ -65,34 +65,57 @@ func WithRootHandler(fn HandlerFunc) Option {
 	}
 }
 
-// SetRootHandler 设置根回调；连接在创建时快照配置，因此只影响后续连接。
-func (server *Server) SetRootHandler(fn HandlerFunc) {
-	server.mu.Lock()
-	defer server.mu.Unlock()
-	if server.config.rootSet {
-		panic("server: root handler already set")
+// WithCodec 设置编解码器
+func WithCodec(c codec.Codec) Option {
+	return func(conf *config) {
+		if c != nil {
+			conf.codec = c
+		}
 	}
-	server.config.rootHandler = fn
-	server.config.rootSet = true
 }
 
-// WithCodec 设置编解码器
-func WithCodec(c codec.Codec) Option { return func(conf *config) { conf.codec = c } }
-
 // WithIdleTimeout 设置空闲超时，默认 10 分钟；0 = 关闭。
-func WithIdleTimeout(d time.Duration) Option { return func(conf *config) { conf.idle = d } }
+func WithIdleTimeout(d time.Duration) Option {
+	return func(conf *config) {
+		if d >= 0 {
+			conf.idle = d
+		}
+	}
+}
 
 // WithQueueSize 设置每连接发送队列容量，默认 1024。
-func WithQueueSize(n int) Option { return func(conf *config) { conf.queue = n } }
+func WithQueueSize(n int) Option {
+	return func(conf *config) {
+		if n > 0 {
+			conf.queue = n
+		}
+	}
+}
 
 // WithHooks 注册一组观测钩子（可多次，按注册序执行）。
-func WithHooks(h Hooks) Option { return func(conf *config) { conf.hooks = append(conf.hooks, h) } }
+func WithHooks(h Hooks) Option {
+	return func(conf *config) {
+		conf.hooks = append(conf.hooks, h)
+	}
+}
 
 // WithLogger 设置日志器，默认 slog.Default()。
-func WithLogger(l *slog.Logger) Option { return func(conf *config) { conf.log = l } }
+func WithLogger(l *slog.Logger) Option {
+	return func(conf *config) {
+		if l != nil {
+			conf.log = l
+		}
+	}
+}
 
 // WithFlushTimeout 设置写超时与停止排空上限，默认 3s。
-func WithFlushTimeout(d time.Duration) Option { return func(conf *config) { conf.flush = d } }
+func WithFlushTimeout(d time.Duration) Option {
+	return func(conf *config) {
+		if d > 0 {
+			conf.flush = d
+		}
+	}
+}
 
 type Server struct {
 	config
@@ -118,18 +141,6 @@ func New(opts ...Option) *Server {
 	for _, o := range opts {
 		o(&conf)
 	}
-	if conf.codec == nil {
-		conf.codec = codec.DefaultCodec(defaultMaxBody)
-	}
-	if conf.queue <= 0 {
-		conf.queue = defaultQueueSize
-	}
-	if conf.log == nil {
-		conf.log = slog.Default()
-	}
-	if conf.flush <= 0 {
-		conf.flush = defaultFlush
-	}
 	return &Server{
 		config: conf,
 		conns:  make(map[uint64]*Conn),
@@ -148,6 +159,9 @@ func (server *Server) Start() error {
 
 // Serve 接管 listener 并后台 accept
 func (server *Server) Serve(listener net.Listener) error {
+	if listener == nil {
+		return errors.New("server: nil listener")
+	}
 	server.mu.Lock()
 	if server.stopping.Load() {
 		server.mu.Unlock()
@@ -164,6 +178,9 @@ func (server *Server) Serve(listener net.Listener) error {
 
 // Connect 把一条已建立的连接接入内核（出站）；连接由 Server 管理并关闭。
 func (server *Server) Connect(conn net.Conn) (*Conn, error) {
+	if conn == nil {
+		return nil, errors.New("server: nil conn")
+	}
 	server.mu.Lock()
 	if server.stopping.Load() {
 		server.mu.Unlock()
@@ -340,17 +357,14 @@ func (server *Server) acceptLoop(listener net.Listener) {
 				continue
 			}
 			fails++
-			// 失败风暴只在首条与放弃前触发 OnError
-			if fails == 1 {
+			// 失败风暴只在首条与每 acceptFailLimit 次触发 OnError，其余记日志
+			if fails == 1 || fails%acceptFailLimit == 0 {
 				server.onError(err)
 			} else {
 				server.log.Error("listener accept failed", "count", fails, "err", err)
 			}
-			if fails >= acceptFailLimit {
-				server.onError(err)
-				return
-			}
-			// 退避封顶 500ms，加抖动防多 listener 同步重试
+			// 退避封顶 500ms，加抖动防多 listener 同步重试；EMFILE 等 FD 风暴
+			// 恢复后自动续接，不再永久退出接环。
 			sleep := min(time.Duration(fails)*acceptRetryBase, acceptRetryMax)
 			sleep = sleep/2 + time.Duration(rand.Int64N(int64(sleep/2)+1))
 			time.Sleep(sleep)

@@ -24,8 +24,8 @@ func WithLogger(l *slog.Logger) Option {
 type Memory struct {
 	mu sync.Mutex
 
-	byName map[string]map[string]Endpoint // name -> addr -> instance
-	nextID int                            // watcher 分配 id
+	byName map[string]map[string]*memInstance // name -> addr -> 实例
+	nextID int                                // watcher 分配 id
 
 	watches map[string][]*watchState // name -> 按注册顺序的 watcher
 	pending map[string]struct{}      // 待派发的 name
@@ -41,7 +41,7 @@ type Memory struct {
 
 func NewMemory(opts ...Option) *Memory {
 	m := &Memory{
-		byName:   make(map[string]map[string]Endpoint),
+		byName:   make(map[string]map[string]*memInstance),
 		watches:  make(map[string][]*watchState),
 		pending:  make(map[string]struct{}),
 		ch:       make(chan struct{}, 1),
@@ -54,6 +54,12 @@ func NewMemory(opts ...Option) *Memory {
 	m.wg.Add(1)
 	go m.dispatchLoop()
 	return m
+}
+
+// memInstance 目录内的一代实例：同地址重复注册产生新的实例，
+// 旧句柄的 dereg 因实例失配而不误删替换后的新实例。
+type memInstance struct {
+	ep Endpoint
 }
 
 type watchState struct {
@@ -80,21 +86,22 @@ func (m *Memory) Register(ctx context.Context, name string, ep Endpoint) (func()
 		m.mu.Unlock()
 		return nil, ErrClosed
 	}
-	insts, ok := m.byName[name]
+	byAddr, ok := m.byName[name]
 	if !ok {
-		insts = make(map[string]Endpoint)
-		m.byName[name] = insts
+		byAddr = make(map[string]*memInstance)
+		m.byName[name] = byAddr
 	}
-	insts[ep.Addr] = ep.clone()
+	inst := &memInstance{ep: ep.clone()}
+	byAddr[ep.Addr] = inst // 同地址重复注册以最新一代为准
 	m.notifyLocked(name)
 	m.mu.Unlock()
 
-	// 仅槽位仍匹配才 remove，避免误删覆盖后的新实例。
+	// 仅本代实例在位才摘除：同地址后续注册后旧句柄 dereg 失配，不误删新实例。
 	remove := func() {
 		m.mu.Lock()
-		if insts, ok := m.byName[name]; ok {
-			if cur, ok2 := insts[ep.Addr]; ok2 && cur.Addr == ep.Addr {
-				delete(insts, ep.Addr)
+		if byAddr, ok := m.byName[name]; ok {
+			if cur, ok2 := byAddr[ep.Addr]; ok2 && cur == inst {
+				delete(byAddr, ep.Addr)
 				m.notifyLocked(name)
 			}
 		}
@@ -171,7 +178,7 @@ func (m *Memory) Close() {
 		return
 	}
 	m.closed = true
-	m.byName = make(map[string]map[string]Endpoint) // 全部实例下线；旧句柄 remove 变 no-op
+	m.byName = make(map[string]map[string]*memInstance) // 全部实例下线；旧句柄 remove 变 no-op
 	for _, ws := range m.watches {
 		if len(ws) == 0 {
 			continue
@@ -216,12 +223,12 @@ func (m *Memory) notifyLocked(name string) {
 	}
 }
 
-// snapshotLocked 生成 name 实例集的有序快照
+// snapshotLocked 生成 name 实例集的有序快照；克隆含 Meta，回调侧不得改动内部状态。
 func (m *Memory) snapshotLocked(name string) []Endpoint {
-	eps := m.byName[name]
-	out := make([]Endpoint, 0, len(eps))
-	for _, ep := range eps {
-		out = append(out, ep)
+	byAddr := m.byName[name]
+	out := make([]Endpoint, 0, len(byAddr))
+	for _, inst := range byAddr {
+		out = append(out, inst.ep.clone())
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Addr < out[j].Addr })
 	return out

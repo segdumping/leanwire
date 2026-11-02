@@ -3,6 +3,7 @@ package registry
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sort"
 	"sync"
 )
@@ -41,9 +42,16 @@ func (s *Static) Watch(_ context.Context, name string, callback func([]Endpoint)
 	s.mu.Lock()
 	endpoints := s.m[name]
 	snap := make([]Endpoint, len(endpoints))
-	copy(snap, endpoints)
+	for i, endpoint := range endpoints {
+		snap[i] = endpoint.clone() // 克隆 Meta：回调侧不得改动内部状态
+	}
 	s.mu.Unlock()
 	if callback != nil {
+		defer func() {
+			if rec := recover(); rec != nil {
+				slog.Error("registry: watcher callback panic", "panic", rec)
+			}
+		}()
 		callback(snap)
 	}
 	return nil

@@ -8,6 +8,23 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # etcd 门控测试（ext/registry/etcd）需要真实目录服务，未设置
+    # ETCD_ENDPOINTS 时这些用例 skip；这里起一个单节点覆盖生产实现。
+    services:
+      etcd:
+        image: gcr.io/etcd-development/etcd:v3.5.15
+        ports:
+          - 2379:2379
+        env:
+          ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+          ETCD_ADVERTISE_CLIENT_URLS: http://127.0.0.1:2379
+        options: >-
+          --health-cmd "etcdctl endpoint health"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      ETCD_ENDPOINTS: 127.0.0.1:2379
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

@@ -58,6 +58,9 @@ type Writer struct {
 	exited    chan struct{}
 	closeOnce sync.Once
 	dropped   atomic.Uint64
+
+	lastErrMu sync.Mutex
+	lastErrV  error // 最近一次写盘失败原因，仅 run 协程写、LastError 读
 }
 
 func New(path string, opts ...Option) (*Writer, error) {
@@ -99,6 +102,19 @@ func (w *Writer) Write(p []byte) (int, error) {
 
 func (w *Writer) Dropped() uint64 { return w.dropped.Load() }
 
+// LastError 最近一次写盘失败的原因；恢复成功后清空（见 reopen）。
+func (w *Writer) LastError() error {
+	w.lastErrMu.Lock()
+	defer w.lastErrMu.Unlock()
+	return w.lastErrV
+}
+
+func (w *Writer) setLastErr(err error) {
+	w.lastErrMu.Lock()
+	w.lastErrV = err
+	w.lastErrMu.Unlock()
+}
+
 // Close 排空队列并关闭文件；幂等。
 func (w *Writer) Close() error {
 	w.closeOnce.Do(func() {
@@ -122,12 +138,15 @@ func (w *Writer) run() {
 }
 
 func (w *Writer) write(b []byte) {
-	if w.f == nil {
-		w.dropped.Add(1)
-		return
+	if w.f == nil { // 上一轮失败后的自愈：先尝试重新打开
+		if !w.reopen() {
+			w.dropped.Add(1)
+			return
+		}
 	}
 	if w.conf.maxSize > 0 && w.size > 0 && w.size+int64(len(b)) > w.conf.maxSize {
 		if err := w.rotate(); err != nil {
+			w.setLastErr(err)
 			w.dropped.Add(1)
 			return
 		}
@@ -135,12 +154,31 @@ func (w *Writer) write(b []byte) {
 	n, err := w.f.Write(b)
 	w.size += int64(n)
 	if err != nil {
+		_ = w.f.Close()
+		w.f = nil // 下次写入先 reopen 重试
+		w.setLastErr(err)
 		w.dropped.Add(1)
 	}
 }
 
+// reopen 失败自愈：重新打开目标文件；恢复成功清掉最近错误。
+func (w *Writer) reopen() bool {
+	f, size, err := openAppend(w.path)
+	if err != nil {
+		w.setLastErr(err)
+		return false
+	}
+	w.f, w.size = f, size
+	w.setLastErr(nil)
+	return true
+}
+
 func (w *Writer) rotate() error {
-	_ = w.f.Close()
+	f := w.f
+	w.f = nil // 统一处理：任一分支失败后置空，下次写入先 reopen 重试
+	if f != nil {
+		_ = f.Close()
+	}
 	if w.conf.maxBackups == 0 {
 		_ = os.Remove(w.path)
 	} else {
@@ -154,7 +192,6 @@ func (w *Writer) rotate() error {
 	}
 	f, size, err := openAppend(w.path)
 	if err != nil {
-		w.f = nil
 		return err
 	}
 	w.f, w.size = f, size

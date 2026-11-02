@@ -108,11 +108,12 @@ func TestPackUnpack(t *testing.T) {
 
 func TestHandleDecorator(t *testing.T) {
 	capH := &capHandler{}
-	testServer := server.New(server.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+	routeTable := router.New()
+	testServer := server.New(server.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))), server.WithRootHandler(routeTable.Handler()))
+	routeTable.Attach(testServer)
 	handle := Handle(slog.New(capH), func(s *server.Conn, m codec.Msg) {
-		_ = s.Send(codec.Msg{ID: m.ID, Body: m.Body})
+		_ = s.Send(nil, codec.Msg{ID: m.ID, Body: m.Body})
 	})
-	routeTable := router.Bind(testServer)
 	routeTable.Handle(10, handle)
 	routeTable.Handle(11, handle)
 

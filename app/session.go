@@ -13,8 +13,8 @@ type SessionID = uint64
 type Session interface {
 	ID() SessionID
 	Conn() *server.Conn
-	SendBytes(msgID uint32, body []byte) error
-	SendWaitBytes(ctx context.Context, msgID uint32, body []byte) error
+	SendBytes(ctx context.Context, msgID uint32, body []byte) error
+	TrySendBytes(msgID uint32, body []byte) error
 }
 
 type session struct {
@@ -25,12 +25,18 @@ type session struct {
 func (s *session) ID() SessionID      { return s.id }
 func (s *session) Conn() *server.Conn { return s.conn }
 
-func (s *session) SendBytes(msgID uint32, body []byte) error {
-	return s.conn.Send(codec.Msg{ID: msgID, Body: body})
+func (s *session) SendBytes(ctx context.Context, msgID uint32, body []byte) error {
+	if reservedID(msgID) { // 与 App.Handle/Client.Send 一致：拦截框架保留号
+		return ErrReservedID
+	}
+	return s.conn.Send(ctx, codec.Msg{ID: msgID, Body: body})
 }
 
-func (s *session) SendWaitBytes(ctx context.Context, msgID uint32, body []byte) error {
-	return s.conn.SendWait(ctx, codec.Msg{ID: msgID, Body: body})
+func (s *session) TrySendBytes(msgID uint32, body []byte) error {
+	if reservedID(msgID) {
+		return ErrReservedID
+	}
+	return s.conn.TrySend(codec.Msg{ID: msgID, Body: body})
 }
 
 // SessionOption 定制会话包装。

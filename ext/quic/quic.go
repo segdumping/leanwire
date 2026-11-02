@@ -3,6 +3,7 @@ package quic
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"net"
 	"sync"
 	"time"
@@ -10,7 +11,39 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-const acceptQueue = 4
+const (
+	acceptQueue = 4
+
+	// defaultKeepAlive 缺省传输层保活周期，需小于 quic-go 默认 MaxIdleTimeout(30s)，
+	// 静默连接在应用层 idle 之外不再被传输层关断。
+	defaultKeepAlive = 15 * time.Second
+
+	acceptErrorBackoff = 100 * time.Millisecond
+)
+
+// Option 定制 QUIC 参数。
+type Option func(*quic.Config)
+
+// WithConfig 替换整套 quic.Config。
+// KeepAlivePeriod 设为 0 表示显式禁用保活；MaxIdleTimeout 设为 0 延用 quic-go 默认 30s。
+// 传输层 idle 与内核 server.WithIdleTimeout 是叠加的两道闸，.configure 时须一并评估。
+func WithConfig(config *quic.Config) Option {
+	return func(cfg *quic.Config) {
+		if config != nil {
+			*cfg = *config
+		}
+	}
+}
+
+func newConfig(opts []Option) *quic.Config {
+	cfg := &quic.Config{KeepAlivePeriod: defaultKeepAlive}
+	for _, o := range opts {
+		if o != nil {
+			o(cfg)
+		}
+	}
+	return cfg
+}
 
 type Conn struct {
 	stream  *quic.Stream
@@ -56,7 +89,7 @@ type Listener struct {
 	conns map[*quic.Conn]struct{}
 }
 
-func Listen(addr string, tlsConf *tls.Config) (net.Listener, error) {
+func Listen(addr string, tlsConf *tls.Config, opts ...Option) (net.Listener, error) {
 	ua, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return nil, err
@@ -65,7 +98,7 @@ func Listen(addr string, tlsConf *tls.Config) (net.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
-	ql, err := quic.Listen(udpConn, tlsConf, nil)
+	ql, err := quic.Listen(udpConn, tlsConf, newConfig(opts))
 	if err != nil {
 		_ = udpConn.Close()
 		return nil, err
@@ -86,7 +119,13 @@ func (l *Listener) acceptConns() {
 	for {
 		qc, err := l.inner.Accept(l.ctx)
 		if err != nil {
-			return
+			// 监听已关闭（ctx 结束 / ErrServerClosed 会 Unwrap 到 net.ErrClosed）才退出；
+			// 其余传输错误退避后继续，避免 Accept 永久悬挂
+			if l.ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			time.Sleep(acceptErrorBackoff)
+			continue
 		}
 		l.addConn(qc)
 		go l.acceptStreams(qc)
@@ -158,7 +197,7 @@ func (l *Listener) Close() error {
 
 func (l *Listener) Addr() net.Addr { return l.inner.Addr() }
 
-func Dial(ctx context.Context, addr string, tlsConf *tls.Config) (net.Conn, error) {
+func Dial(ctx context.Context, addr string, tlsConf *tls.Config, opts ...Option) (net.Conn, error) {
 	ua, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return nil, err
@@ -167,7 +206,7 @@ func Dial(ctx context.Context, addr string, tlsConf *tls.Config) (net.Conn, erro
 	if err != nil {
 		return nil, err
 	}
-	qc, err := quic.Dial(ctx, udpConn, ua, tlsConf, nil)
+	qc, err := quic.Dial(ctx, udpConn, ua, tlsConf, newConfig(opts))
 	if err != nil {
 		_ = udpConn.Close()
 		return nil, err

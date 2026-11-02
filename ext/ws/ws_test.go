@@ -23,9 +23,10 @@ func quietLogger() *slog.Logger {
 
 // 内核在 WS 传输上的同套测试：echo、顺序与关闭收尾。
 func TestWSParity(t *testing.T) {
-	a := server.New(server.WithLogger(quietLogger()), server.WithIdleTimeout(time.Minute))
-	routeTable := router.Bind(a)
-	routeTable.Handle(1, func(s *server.Conn, m codec.Msg) { _ = s.Send(m) })
+	routeTable := router.New()
+	a := server.New(server.WithLogger(quietLogger()), server.WithIdleTimeout(time.Minute), server.WithRootHandler(routeTable.Handler()))
+	routeTable.Attach(a)
+	routeTable.Handle(1, func(s *server.Conn, m codec.Msg) { _ = s.Send(nil, m) })
 
 	listener, err := Listen("127.0.0.1:0")
 	if err != nil {
@@ -76,8 +77,9 @@ func TestWSParity(t *testing.T) {
 // 并发 Write 必须串行：gorilla 禁止并发 writer，旧实现在此处 panic/交织。
 func TestWSConcurrentWrites(t *testing.T) {
 	msgCh := make(chan codec.Msg, 64)
-	a := server.New(server.WithLogger(quietLogger()), server.WithIdleTimeout(time.Minute))
-	routeTable := router.Bind(a)
+	routeTable := router.New()
+	a := server.New(server.WithLogger(quietLogger()), server.WithIdleTimeout(time.Minute), server.WithRootHandler(routeTable.Handler()))
+	routeTable.Attach(a)
 	routeTable.Handle(1, func(_ *server.Conn, m codec.Msg) {
 		select {
 		case msgCh <- m:

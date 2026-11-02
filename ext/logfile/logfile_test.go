@@ -151,3 +151,76 @@ func TestSlogIntegration(t *testing.T) {
 		t.Fatalf("slog line missing: %s", b)
 	}
 }
+
+// rotate 失败后写入不再永久死亡：置空句柄、下次写入先 reopen 重试，LastError 可观测。
+func TestRotateFailureSelfHeal(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	w, err := New(path, WithMaxSize(64), WithMaxBackups(1), WithBuffer(8))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const msg1 = "first-000000000000000000000000000000\n"
+	const msg2 = "second-000000000000000000000000000\n"
+	if _, err := fmt.Fprint(w, msg1); err != nil {
+		t.Fatal(err)
+	}
+
+	// 阻断轮转：.1 是带内容的目录，maxBackups=1 时 remove/rename 均不可移除
+	if err := os.Mkdir(path+".1", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path+".1", "placeholder"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fmt.Fprint(w, msg2); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if w.LastError() != nil && w.Dropped() > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if w.LastError() == nil {
+		t.Fatal("LastError must surface the rotate failure")
+	}
+
+	// 消除阻断后自愈：reopen + rotate 成功，LastError 清空
+	if err := os.RemoveAll(path + ".1"); err != nil {
+		t.Fatal(err)
+	}
+	const msg3 = "third-00000000000000000000000000000\n"
+	if _, err := fmt.Fprint(w, msg3); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if w.LastError() == nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if w.LastError() != nil {
+		t.Fatalf("LastError after heal = %v", w.LastError())
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	b1, err := os.ReadFile(path + ".1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(b1, []byte(msg1)) {
+		t.Fatalf("rotated backup = %q, want msg1", b1)
+	}
+	b3, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(b3, []byte(msg3)) {
+		t.Fatalf("current file = %q, want msg3", b3)
+	}
+}

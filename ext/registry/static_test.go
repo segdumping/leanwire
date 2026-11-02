@@ -43,6 +43,41 @@ func TestStaticSnapshot(t *testing.T) {
 		t.Fatalf("want ErrReadOnly, got %v", err)
 	}
 
+	// 快照 Meta 克隆：回调侧改动不得污染内部表
+	var get []Endpoint
+	if err := r.Watch(t.Context(), "game", func(endpoints []Endpoint) { get = endpoints }); err != nil {
+		t.Fatal(err)
+	}
+	get[0].Meta["svrid"] = "polluted"
+	var got2 []Endpoint
+	if err := r.Watch(t.Context(), "game", func(endpoints []Endpoint) { got2 = endpoints }); err != nil {
+		t.Fatal(err)
+	}
+	if got2[0].Meta["svrid"] != "2001" {
+		t.Fatalf("snapshot Meta polluted internal table: %+v", got2)
+	}
+
+	// watcher 回调 panic 被隔离，不影响后续交付
+	broken := false
+	func() {
+		defer func() {
+			if recover() != nil {
+				broken = true
+			}
+		}()
+		_ = r.Watch(t.Context(), "game", func([]Endpoint) { panic("boom") })
+	}()
+	if broken {
+		t.Fatal("watcher panic must be isolated")
+	}
+	var after []Endpoint
+	if err := r.Watch(t.Context(), "game", func(endpoints []Endpoint) { after = endpoints }); err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != 2 {
+		t.Fatalf("subsequent watch broken by previous panic: %+v", after)
+	}
+
 	// 空 Addr 构造期 panic
 	defer func() {
 		if recover() == nil {
